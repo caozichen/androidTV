@@ -4,6 +4,8 @@ import android.content.Context
 import android.os.Bundle
 import androidx.activity.ComponentActivity
 import androidx.activity.compose.setContent
+import androidx.activity.viewModels
+import androidx.compose.foundation.isSystemInDarkTheme
 import androidx.compose.foundation.layout.Arrangement
 import androidx.compose.foundation.layout.Column
 import androidx.compose.foundation.layout.Spacer
@@ -16,6 +18,9 @@ import androidx.compose.foundation.layout.windowInsetsPadding
 import androidx.compose.foundation.rememberScrollState
 import androidx.compose.foundation.verticalScroll
 import androidx.compose.material3.MaterialTheme
+import androidx.compose.material3.darkColorScheme
+import androidx.compose.material3.lightColorScheme
+import androidx.compose.material3.TextButton
 import androidx.compose.material3.Surface
 import androidx.compose.material3.Text
 import androidx.compose.runtime.Composable
@@ -39,14 +44,20 @@ import kotlinx.coroutines.Dispatchers
 import kotlinx.coroutines.withContext
 
 class MainActivity : ComponentActivity() {
+    private val catalog: CatalogState by viewModels()
+
     override fun onCreate(savedInstanceState: Bundle?) {
         super.onCreate(savedInstanceState)
-        setContent { MaterialTheme { EnvironmentScreen() } }
+        setContent {
+            MaterialTheme(colorScheme = if (isSystemInDarkTheme()) darkColorScheme() else lightColorScheme()) {
+                CatalogScreen(catalog)
+            }
+        }
     }
 }
 
 @Composable
-private fun EnvironmentScreen() {
+internal fun EnvironmentScreen(onBack: () -> Unit) {
     val context = LocalContext.current.applicationContext
     val pending = stringResource(R.string.pending)
     var databaseResult by remember { mutableStateOf(pending) }
@@ -67,6 +78,7 @@ private fun EnvironmentScreen() {
                 .padding(horizontal = 24.dp, vertical = 32.dp),
             verticalArrangement = Arrangement.spacedBy(8.dp),
         ) {
+            TextButton(onClick = onBack) { Text("返回点播") }
             Text(stringResource(R.string.app_name), style = MaterialTheme.typography.headlineMedium)
             Text(stringResource(R.string.stage_title), style = MaterialTheme.typography.titleMedium)
             Spacer(Modifier.height(16.dp))

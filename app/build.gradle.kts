@@ -14,8 +14,8 @@ android {
         applicationId = "dev.libretv.android"
         minSdk = 26
         targetSdk = 35
-        versionCode = 1
-        versionName = "0.1.0"
+        versionCode = 2
+        versionName = "0.1.1"
     }
 
     buildTypes {
@@ -39,6 +39,9 @@ room {
 }
 
 dependencies {
+    implementation(libs.okhttp)
+    testImplementation(libs.junit)
+    testImplementation(libs.json)
     implementation(platform(libs.compose.bom))
     implementation(libs.activity.compose)
     implementation(libs.compose.ui)

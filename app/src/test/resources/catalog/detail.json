@@ -1,0 +1,8 @@
+{
+  "code": 1,
+  "list": [{
+    "vod_id": "17",
+    "vod_play_from": "网页$$$高清$$$备用",
+    "vod_play_url": "短片$https://catalog.example.org/share/17$$$第一集$https://media.example.org/a/master.m3u8?sig=x$y#第二集$https://media.example.org/b/master.m3u8#无效$http://media.example.org/old.m3u8$$$https://media.example.org/c.mp4"
+  }]
+}
