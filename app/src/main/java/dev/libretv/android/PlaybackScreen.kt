@@ -32,6 +32,7 @@ import androidx.media3.exoplayer.source.MediaLoadData
 import androidx.media3.ui.PlayerView
 import java.io.IOException
 import kotlinx.coroutines.delay
+import kotlinx.coroutines.launch
 
 const val CONTROL_HLS_URL = "asset:///control/index.m3u8"
 private const val PLAYBACK_TAG = "LibreTVPlayback"
@@ -41,6 +42,7 @@ private const val PLAYBACK_TAG = "LibreTVPlayback"
 fun PlaybackScreen(title: String, url: String, onBack: () -> Unit) {
     val context = LocalContext.current.applicationContext
     val lifecycle = (LocalActivity.current as ComponentActivity).lifecycle
+    val playbackScope = rememberCoroutineScope()
     val control = url == CONTROL_HLS_URL
     val itemUri = remember(url) { Uri.parse(url) }
     val valid = control || (itemUri.scheme == "https" && !itemUri.host.isNullOrEmpty())
@@ -82,11 +84,6 @@ fun PlaybackScreen(title: String, url: String, onBack: () -> Unit) {
         audioAdvanced = false
         manifests = 0
         mediaLoads = 0
-        val item = MediaItem.Builder().setUri(itemUri).apply {
-            if (control || itemUri.path?.endsWith(".m3u8", ignoreCase = true) == true) {
-                setMimeType(MimeTypes.APPLICATION_M3U8)
-            }
-        }.build()
         val listener = object : Player.Listener {
             override fun onPlaybackStateChanged(state: Int) {
                 status = when (state) {
@@ -144,9 +141,13 @@ fun PlaybackScreen(title: String, url: String, onBack: () -> Unit) {
         }
         player.addListener(listener)
         player.addAnalyticsListener(analytics)
-        player.setMediaItem(item, position)
         player.playWhenReady = resume && lifecycle.currentState.isAtLeast(Lifecycle.State.STARTED)
-        player.prepare()
+        val preparation = playbackScope.launch {
+            val mime = resolvePlaybackMimeType(url)
+            val item = MediaItem.Builder().setUri(itemUri).setMimeType(mime).build()
+            player.setMediaItem(item, position)
+            player.prepare()
+        }
         livePlayer = player
         Log.i(PLAYBACK_TAG, "open source=" + if (control) "asset" else "https")
         val observer = LifecycleEventObserver { _, event ->
@@ -162,6 +163,7 @@ fun PlaybackScreen(title: String, url: String, onBack: () -> Unit) {
         }
         lifecycle.addObserver(observer)
         onDispose {
+            preparation.cancel()
             lifecycle.removeObserver(observer)
             player.removeListener(listener)
             player.removeAnalyticsListener(analytics)
