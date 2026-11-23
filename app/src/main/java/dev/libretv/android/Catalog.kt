@@ -1,6 +1,8 @@
 package dev.libretv.android
 
 import java.io.IOException
+import java.io.InterruptedIOException
+import java.net.UnknownHostException
 import java.util.concurrent.TimeUnit
 import kotlin.coroutines.resume
 import kotlin.coroutines.resumeWithException
@@ -24,6 +26,24 @@ data class Episode(val name: String, val url: String)
 data class PlayLine(val name: String, val episodes: List<Episode>)
 
 private const val MAX_BYTES = 4L * 1024 * 1024
+private class CatalogHttpError(val status: Int) : IOException("点播源返回 HTTP $status")
+private class CatalogResponseError(val displayText: String) : IOException(displayText)
+
+internal fun catalogErrorText(error: Exception): String = when (error) {
+    is CatalogHttpError -> if (error.status == 429) {
+        "请求过于频繁（HTTP 429），请稍后重试"
+    } else {
+        "点播源返回 HTTP ${error.status}，可稍后重试或换源"
+    }
+    is CatalogResponseError -> error.displayText
+    is JSONException -> "点播源返回的数据格式无效，请检查片源或换源"
+    is UnknownHostException -> "无法解析点播源域名，请检查网络和片源地址"
+    is InterruptedIOException -> "请求超时，请稍后重试或换源"
+    is IOException -> "网络连接失败，请检查网络后重试"
+    is IllegalArgumentException -> "请求参数无效，请检查片源地址或输入内容"
+    else -> "请求失败，请重试或换源"
+}
+
 private val client = OkHttpClient.Builder()
     .connectTimeout(8, TimeUnit.SECONDS)
     .readTimeout(10, TimeUnit.SECONDS)
@@ -79,17 +99,17 @@ private suspend fun fetchCatalog(url: HttpUrl): String = suspendCancellableCorou
 }
 
 internal fun readCatalogResponse(response: Response): String {
-    if (!response.isSuccessful) throw IOException("点播源返回 HTTP ${response.code}")
-    val body = response.body ?: throw IOException("点播源返回空响应")
+    if (!response.isSuccessful) throw CatalogHttpError(response.code)
+    val body = response.body ?: throw CatalogResponseError("点播源返回空响应，请重试或换源")
     if (body.contentLength() > MAX_BYTES || body.source().request(MAX_BYTES + 1)) {
-        throw IOException("点播源响应超过 4 MiB")
+        throw CatalogResponseError("点播源响应超过 4 MiB，请换源")
     }
     return body.string().removePrefix("\uFEFF")
 }
 
 private fun resultList(json: String): JSONArray {
     val root = JSONObject(json)
-    if (root.has("code") && root.optString("code") == "0") throw IOException("点播源返回业务错误")
+    if (root.has("code") && root.optString("code") == "0") throw CatalogResponseError("点播源返回业务错误，请重试或换源")
     if (!root.has("list")) throw JSONException("点播源缺少 list 字段")
     if (root.isNull("list")) return JSONArray()
     return root.getJSONArray("list")
@@ -134,7 +154,7 @@ private fun parseEpisode(index: Int, raw: String): Episode? {
     val url = entry.substring(delimiter + 1).trim().toHttpUrlOrNull() ?: return null
     if (!url.isHttps || url.username.isNotEmpty() || url.password.isNotEmpty()) return null
     val path = url.encodedPath.lowercase()
-    // Known web-player routes return HTML rather than a media stream. Keep extensionless media APIs.
-    if (path.endsWith(".html") || path.endsWith(".htm") || path.startsWith("/share/")) return null
+    val directMedia = path.endsWith(".m3u8") || path.endsWith(".mp4")
+    if (path.endsWith(".html") || path.endsWith(".htm") || (path.startsWith("/share/") && !directMedia)) return null
     return Episode(label.ifEmpty { "第 ${index + 1} 集" }, url.toString())
 }

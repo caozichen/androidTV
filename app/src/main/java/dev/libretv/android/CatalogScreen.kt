@@ -29,6 +29,14 @@ private const val SAMPLE = "航拍中国"
 private const val LIMIT = 128 * 1024
 internal data class FilmHit(val source: CmsSource, val film: Film)
 
+internal fun selectionAfterImport(
+    previous: List<CmsSource>, enabled: Set<CmsSource>, updated: List<CmsSource>,
+): Set<CmsSource> {
+    val existingUrls = previous.map { it.url }.toSet()
+    val enabledUrls = enabled.map { it.url }.toSet()
+    return updated.filterTo(mutableSetOf()) { it.url !in existingUrls || it.url in enabledUrls }
+}
+
 private fun decodeSources(text: String): List<CmsSource> {
     val rows = JSONObject(text.removePrefix("\uFEFF")).getJSONArray("sources")
     require(rows.length() in 1..50)
@@ -90,10 +98,10 @@ internal class CatalogState(private val app: Application) : AndroidViewModel(app
                     }
                     decodeSources(raw)
                 }
-                clearSearch()
                 val updated = (imported + sources).distinctBy { it.url }
                 require(updated.size <= 50)
-                selected = updated.filter { s -> s in imported || selected.any { it.url == s.url } }.toSet()
+                clearSearch()
+                selected = selectionAfterImport(sources, selected, updated)
                 sources = updated
                 val rows = JSONArray()
                 for (source in updated) rows.put(JSONObject().put("name", source.name).put("url", source.url))
@@ -139,8 +147,8 @@ internal class CatalogState(private val app: Application) : AndroidViewModel(app
                         groups[source] = searchCatalog(source, term)
                     } catch (e: CancellationException) {
                         throw e
-                    } catch (_: Exception) {
-                        errors[source] = "搜索失败，可重试或换源"
+                    } catch (e: Exception) {
+                        errors[source] = catalogErrorText(e)
                     }
                 }
             }
@@ -161,8 +169,8 @@ internal class CatalogState(private val app: Application) : AndroidViewModel(app
                 detailStatus = if (lines.isEmpty()) "此来源暂无可播放的 HTTPS 剧集" else ""
             } catch (e: CancellationException) {
                 throw e
-            } catch (_: Exception) {
-                detailStatus = "剧集加载失败，可重试或换源"
+            } catch (e: Exception) {
+                detailStatus = catalogErrorText(e)
             }
         }
     }
