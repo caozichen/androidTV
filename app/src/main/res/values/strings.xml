@@ -1,0 +1,11 @@
+<?xml version="1.0" encoding="utf-8"?>
+<resources>
+    <string name="app_name">LibreTV</string>
+    <string name="stage_title">环境验证</string>
+    <string name="database_title">Room 数据库</string>
+    <string name="player_title">Media3 播放引擎</string>
+    <string name="pending">正在检查…</string>
+    <string name="database_ok">通过 · 已写入并读回 1 条记录</string>
+    <string name="player_ok">通过 · 已创建 ExoPlayer 和 HLS 媒体源</string>
+    <string name="check_failed">失败 · %1$s</string>
+</resources>

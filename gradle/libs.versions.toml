@@ -1,0 +1,25 @@
+[versions]
+agp = "9.0.1"
+kotlin = "2.2.10"
+ksp = "2.3.5"
+room = "2.8.4"
+compose-bom = "2025.10.01"
+activity = "1.11.0"
+media3 = "1.8.0"
+
+[libraries]
+compose-bom = { module = "androidx.compose:compose-bom", version.ref = "compose-bom" }
+compose-ui = { module = "androidx.compose.ui:ui" }
+compose-material3 = { module = "androidx.compose.material3:material3" }
+activity-compose = { module = "androidx.activity:activity-compose", version.ref = "activity" }
+room-runtime = { module = "androidx.room:room-runtime", version.ref = "room" }
+room-compiler = { module = "androidx.room:room-compiler", version.ref = "room" }
+media3-exoplayer = { module = "androidx.media3:media3-exoplayer", version.ref = "media3" }
+media3-hls = { module = "androidx.media3:media3-exoplayer-hls", version.ref = "media3" }
+media3-ui = { module = "androidx.media3:media3-ui", version.ref = "media3" }
+
+[plugins]
+android-application = { id = "com.android.application", version.ref = "agp" }
+compose-compiler = { id = "org.jetbrains.kotlin.plugin.compose", version.ref = "kotlin" }
+ksp = { id = "com.google.devtools.ksp", version.ref = "ksp" }
+room = { id = "androidx.room", version.ref = "room" }
