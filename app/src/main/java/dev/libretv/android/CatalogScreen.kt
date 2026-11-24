@@ -21,7 +21,19 @@ internal fun CatalogScreen(state: CatalogState) {
     val hit = state.detail
     BackHandler(enabled = player == null && (hit != null || state.environment), onBack = state::back)
     when {
-        player != null -> PlaybackScreen(title = player.first, url = player.second, onBack = state::back)
+        player != null -> {
+            val line = if (player.ref == null) null else state.lines.getOrNull(state.lineIndex)
+            val labels = remember(line) { line?.episodeLabels().orEmpty() }
+            PlaybackScreen(
+                title = player.title,
+                url = player.url,
+                sessionKey = player.ref ?: CONTROL_HLS_URL,
+                episodeNames = labels,
+                episodeIndex = player.index,
+                onEpisode = { index -> if (state.player == player && index in labels.indices) state.play(index) },
+                onBack = state::back,
+            )
+        }
         state.managing -> SourceManagerScreen(state, state::back)
         state.environment -> EnvironmentScreen(onBack = state::back)
         else -> Surface(Modifier.fillMaxSize()) {
@@ -52,7 +64,7 @@ internal fun CatalogScreen(state: CatalogState) {
                     item {
                         Row(Modifier.fillMaxWidth(), horizontalArrangement = Arrangement.SpaceBetween) {
                             TextButton(onClick = { state.managing = true }) { Text(if (state.managerRows.isEmpty()) "添加点播源" else "点播源管理") }
-                            TextButton(onClick = { state.player = "HLS 对照样片" to CONTROL_HLS_URL }) { Text("播放对照样片") }
+                            TextButton(onClick = state::playControl) { Text("播放对照样片") }
                         }
                     }
                     if (state.managerRows.isNotEmpty()) {
@@ -122,10 +134,10 @@ internal fun CatalogScreen(state: CatalogState) {
                                 FilterChip(selected = state.lineIndex == index, onClick = { state.selectLine(index) }, label = { Text(state.lines[index].name) })
                             }
                             item { Text("选择剧集", style = MaterialTheme.typography.titleMedium) }
-                            items(state.lines[state.lineIndex].episodes.size) { index ->
-                                val ep = state.lines[state.lineIndex].episodes[index]
+                            val labels = state.lines[state.lineIndex].episodeLabels()
+                            items(labels.size) { index ->
                                 OutlinedButton(onClick = { state.play(index) }) {
-                                    Text(if (state.lastEpisode != null && state.lastEpisode == state.episodeRef(index)) "${ep.name} · 已选" else ep.name)
+                                    Text(if (state.lastEpisode != null && state.lastEpisode == state.episodeRef(index)) "${labels[index]} · 已选" else labels[index])
                                 }
                             }
                         }

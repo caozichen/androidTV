@@ -27,6 +27,13 @@ data class Film(val id: String, val title: String, val year: String, val categor
 data class Episode(val name: String, val url: String, val explicitLabel: Boolean = true)
 data class PlayLine(val name: String, val episodes: List<Episode>)
 
+internal fun PlayLine.episodeLabels(): List<String> {
+    val counts = episodes.groupingBy { it.name }.eachCount()
+    return episodes.mapIndexed { index, episode ->
+        if (counts[episode.name] == 1) episode.name else "${episode.name}（第 ${index + 1} 项）"
+    }
+}
+
 private const val MAX_BYTES = 4L * 1024 * 1024
 private class CatalogHttpError(val status: Int) : IOException("点播源返回 HTTP $status")
 private class CatalogResponseError(val displayText: String) : IOException(displayText)

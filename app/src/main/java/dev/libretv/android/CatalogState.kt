@@ -12,6 +12,12 @@ import kotlinx.coroutines.launch
 internal const val SAMPLE = "航拍中国"
 internal data class VideoRef(val sourceId: String, val vodId: String)
 internal data class EpisodeRef(val video: VideoRef, val lineId: String, val episodeId: String)
+internal data class PlaybackSelection(
+    val title: String,
+    val url: String,
+    val ref: EpisodeRef? = null,
+    val index: Int = -1,
+)
 internal data class FilmHit(val source: CmsSource, val film: Film) {
     val ref get() = VideoRef(source.id, film.id)
 }
@@ -49,7 +55,8 @@ internal class CatalogState(app: Application) : SourceManagerState(app) {
     var loadingDetail by mutableStateOf(false)
         private set
     var choosingSource by mutableStateOf(false)
-    var player by mutableStateOf<Pair<String, String>?>(null)
+    var player by mutableStateOf<PlaybackSelection?>(null)
+        private set
     private var request: Job? = null
     private val retries = mutableMapOf<String, Job>()
     private var fullSearchRunning = false
@@ -252,9 +259,15 @@ internal class CatalogState(app: Application) : SourceManagerState(app) {
     }
 
     fun play(index: Int) {
+        val film = detail?.film ?: return
+        val ref = episodeRef(index) ?: return
         rememberEpisode(index)
         val episode = selectedEpisode ?: return
-        player = "${detail?.film?.title} · ${episode.name}" to episode.url
+        player = PlaybackSelection("${film.title} · ${lines[lineIndex].episodeLabels()[index]}", episode.url, ref, index)
+    }
+
+    fun playControl() {
+        player = PlaybackSelection("HLS 对照样片", CONTROL_HLS_URL)
     }
 
     fun back() {

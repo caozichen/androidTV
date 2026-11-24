@@ -1,213 +1,268 @@
 package dev.libretv.android
 
-import android.net.Uri
-import android.util.Log
-import androidx.activity.ComponentActivity
+import android.content.pm.ActivityInfo
+import android.content.res.Configuration
 import androidx.activity.compose.BackHandler
 import androidx.activity.compose.LocalActivity
+import androidx.compose.foundation.background
+import androidx.compose.foundation.clickable
+import androidx.compose.foundation.horizontalScroll
 import androidx.compose.foundation.layout.*
+import androidx.compose.foundation.lazy.LazyColumn
+import androidx.compose.foundation.lazy.rememberLazyListState
 import androidx.compose.foundation.rememberScrollState
 import androidx.compose.foundation.verticalScroll
 import androidx.compose.material3.*
 import androidx.compose.runtime.*
 import androidx.compose.runtime.saveable.rememberSaveable
+import androidx.compose.ui.Alignment
 import androidx.compose.ui.Modifier
-import androidx.compose.ui.platform.LocalContext
+import androidx.compose.ui.graphics.Color
+import androidx.compose.ui.platform.LocalAccessibilityManager
+import androidx.compose.ui.platform.LocalConfiguration
+import androidx.compose.ui.res.painterResource
+import androidx.compose.ui.semantics.contentDescription
+import androidx.compose.ui.semantics.semantics
+import androidx.compose.ui.text.style.TextOverflow
 import androidx.compose.ui.unit.dp
 import androidx.compose.ui.viewinterop.AndroidView
-import androidx.lifecycle.Lifecycle
-import androidx.lifecycle.LifecycleEventObserver
-import androidx.media3.common.*
+import androidx.core.view.WindowCompat
+import androidx.core.view.WindowInsetsCompat
+import androidx.core.view.WindowInsetsControllerCompat
 import androidx.media3.common.util.UnstableApi
-import androidx.media3.datasource.AssetDataSource
-import androidx.media3.datasource.DataSource
-import androidx.media3.datasource.DefaultHttpDataSource
-import androidx.media3.datasource.HttpDataSource
-import androidx.media3.datasource.ResolvingDataSource
-import androidx.media3.exoplayer.ExoPlayer
-import androidx.media3.exoplayer.analytics.AnalyticsListener
-import androidx.media3.exoplayer.source.DefaultMediaSourceFactory
-import androidx.media3.exoplayer.source.LoadEventInfo
-import androidx.media3.exoplayer.source.MediaLoadData
+import androidx.media3.ui.AspectRatioFrameLayout
 import androidx.media3.ui.PlayerView
-import java.io.IOException
+import androidx.media3.ui.R as MediaR
 import kotlinx.coroutines.delay
-import kotlinx.coroutines.launch
-
-const val CONTROL_HLS_URL = "asset:///control/index.m3u8"
-private const val PLAYBACK_TAG = "LibreTVPlayback"
+import java.util.Locale
 
 @androidx.annotation.OptIn(UnstableApi::class)
 @Composable
-fun PlaybackScreen(title: String, url: String, onBack: () -> Unit) {
-    val context = LocalContext.current.applicationContext
-    val lifecycle = (LocalActivity.current as ComponentActivity).lifecycle
-    val playbackScope = rememberCoroutineScope()
-    val control = url == CONTROL_HLS_URL
-    val itemUri = remember(url) { Uri.parse(url) }
-    val valid = control || (itemUri.scheme == "https" && !itemUri.host.isNullOrEmpty())
-    var position by rememberSaveable(url) { mutableLongStateOf(0L) }
-    var resume by rememberSaveable(url) { mutableStateOf(true) }
-    var attempt by remember(url) { mutableIntStateOf(0) }
-    var livePlayer by remember(url) { mutableStateOf<ExoPlayer?>(null) }
-    var status by remember(url) { mutableStateOf("正在准备") }
-    var failure by remember(url) { mutableStateOf<String?>(null) }
-    var manifests by remember(url) { mutableIntStateOf(0) }
-    var mediaLoads by remember(url) { mutableIntStateOf(0) }
-    var firstFrame by remember(url) { mutableStateOf(false) }
-    var audioTrack by remember(url) { mutableStateOf(false) }
-    var audioAdvanced by remember(url) { mutableStateOf(false) }
-    var isPlaying by remember(url) { mutableStateOf(false) }
+internal fun PlaybackScreen(
+    title: String,
+    url: String,
+    sessionKey: Any,
+    episodeNames: List<String>,
+    episodeIndex: Int,
+    onEpisode: (Int) -> Unit,
+    onBack: () -> Unit,
+) {
+    val activity = checkNotNull(LocalActivity.current)
+    val landscape = LocalConfiguration.current.orientation == Configuration.ORIENTATION_LANDSCAPE
+    val originalOrientation = rememberSaveable { activity.requestedOrientation }
+    var fullScreen by rememberSaveable { mutableStateOf(landscape) }
+    var lastLandscape by rememberSaveable { mutableStateOf(landscape) }
+    var choosingEpisode by rememberSaveable { mutableStateOf(false) }
+    val session = rememberPlaybackSession(sessionKey, url)
+    var controlsVisible by remember(session) { mutableStateOf(true) }
+    var scrubbing by remember(session) { mutableStateOf(false) }
+    val accessibility = LocalAccessibilityManager.current
+    val controlsTimeout = accessibility?.calculateRecommendedTimeoutMillis(
+        originalTimeoutMillis = 5_000L, containsIcons = true, containsText = true, containsControls = true,
+    ) ?: 5_000L
 
-    BackHandler(onBack = onBack)
-    DisposableEffect(url, attempt, lifecycle) {
-        if (!valid) {
-            failure = "播放地址无效"
-            return@DisposableEffect onDispose {}
+    LaunchedEffect(landscape) {
+        if (landscape != lastLandscape) {
+            lastLandscape = landscape
+            fullScreen = landscape
+            controlsVisible = true
         }
-        val source: DataSource.Factory = if (control) {
-            DataSource.Factory { AssetDataSource(context) }
-        } else {
-            ResolvingDataSource.Factory(DefaultHttpDataSource.Factory()) { spec ->
-                if (spec.uri.scheme != "https") throw IOException("HTTPS required")
-                spec
-            }
-        }
-        val player = ExoPlayer.Builder(context)
-            .setMediaSourceFactory(DefaultMediaSourceFactory(source))
-            .setAudioAttributes(AudioAttributes.DEFAULT, true)
-            .setHandleAudioBecomingNoisy(true)
-            .build()
-        failure = null
-        firstFrame = false
-        audioTrack = false
-        audioAdvanced = false
-        manifests = 0
-        mediaLoads = 0
-        val listener = object : Player.Listener {
-            override fun onPlaybackStateChanged(state: Int) {
-                status = when (state) {
-                    Player.STATE_BUFFERING -> "缓冲中"
-                    Player.STATE_READY -> "就绪"
-                    Player.STATE_ENDED -> "已播完"
-                    else -> "等待"
-                }
-            }
-            override fun onIsPlayingChanged(playing: Boolean) {
-                isPlaying = playing
-            }
-            override fun onRenderedFirstFrame() {
-                firstFrame = true
-                Log.i(PLAYBACK_TAG, "first_frame position_ms=" + player.currentPosition)
-            }
-            override fun onTracksChanged(tracks: Tracks) {
-                audioTrack = tracks.isTypeSelected(C.TRACK_TYPE_AUDIO)
-                Log.i(PLAYBACK_TAG, "tracks audio_selected=" + audioTrack)
-            }
-            override fun onPositionDiscontinuity(old: Player.PositionInfo, new: Player.PositionInfo, reason: Int) {
-                if (reason == Player.DISCONTINUITY_REASON_SEEK) {
-                    position = new.positionMs
-                    Log.i(PLAYBACK_TAG, "seek from_ms=" + old.positionMs + " to_ms=" + new.positionMs)
-                }
-            }
-            override fun onPlayerError(error: PlaybackException) {
-                val http = generateSequence<Throwable>(error) { it.cause }
-                    .filterIsInstance<HttpDataSource.InvalidResponseCodeException>().firstOrNull()?.responseCode
-                failure = listOfNotNull(error.errorCodeName, http?.let { "HTTP " + it }).joinToString(" · ")
-                Log.w(PLAYBACK_TAG, "player_error code=" + error.errorCodeName + " http=" + http)
-            }
-        }
-        val analytics = object : AnalyticsListener {
-            override fun onLoadCompleted(time: AnalyticsListener.EventTime, info: LoadEventInfo, data: MediaLoadData) {
-                when (data.dataType) {
-                    C.DATA_TYPE_MANIFEST -> {
-                        manifests++
-                        Log.i(PLAYBACK_TAG, "manifest count=" + manifests)
-                    }
-                    C.DATA_TYPE_MEDIA -> {
-                        mediaLoads++
-                        Log.i(PLAYBACK_TAG, "media count=" + mediaLoads + " bytes=" + info.bytesLoaded)
-                    }
-                }
-            }
-            override fun onAudioPositionAdvancing(time: AnalyticsListener.EventTime, playoutStartSystemTimeMs: Long) {
-                audioAdvanced = true
-                Log.i(PLAYBACK_TAG, "audio_output advancing=true")
-            }
-            override fun onLoadError(time: AnalyticsListener.EventTime, info: LoadEventInfo, data: MediaLoadData, error: IOException, wasCanceled: Boolean) {
-                val phase = if (data.dataType == C.DATA_TYPE_MANIFEST) "manifest" else "media"
-                Log.w(PLAYBACK_TAG, "load_error phase=" + phase + " kind=" + error.javaClass.simpleName + " canceled=" + wasCanceled)
-            }
-        }
-        player.addListener(listener)
-        player.addAnalyticsListener(analytics)
-        player.playWhenReady = resume && lifecycle.currentState.isAtLeast(Lifecycle.State.STARTED)
-        val preparation = playbackScope.launch {
-            val mime = resolvePlaybackMimeType(url)
-            val item = MediaItem.Builder().setUri(itemUri).setMimeType(mime).build()
-            player.setMediaItem(item, position)
-            player.prepare()
-        }
-        livePlayer = player
-        Log.i(PLAYBACK_TAG, "open source=" + if (control) "asset" else "https")
-        val observer = LifecycleEventObserver { _, event ->
-            when (event) {
-                Lifecycle.Event.ON_STOP -> {
-                    resume = player.playWhenReady
-                    position = player.currentPosition
-                    player.pause()
-                }
-                Lifecycle.Event.ON_START -> player.playWhenReady = resume
-                else -> Unit
-            }
-        }
-        lifecycle.addObserver(observer)
+    }
+    val bars = WindowInsetsCompat.Type.statusBars() or WindowInsetsCompat.Type.navigationBars()
+    val controller = remember(activity) {
+        val window = activity.window
+        WindowCompat.getInsetsController(window, window.decorView)
+    }
+    val originalBarsBehavior = remember(controller) { controller.systemBarsBehavior }
+    DisposableEffect(activity) {
         onDispose {
-            preparation.cancel()
-            lifecycle.removeObserver(observer)
-            player.removeListener(listener)
-            player.removeAnalyticsListener(analytics)
-            player.release()
-            livePlayer = null
+            controller.systemBarsBehavior = originalBarsBehavior
+            controller.show(bars)
+            activity.requestedOrientation = originalOrientation
         }
     }
-
-    LaunchedEffect(livePlayer, isPlaying) {
-        val player = livePlayer ?: return@LaunchedEffect
-        var lastReported = -1L
-        while (isPlaying) {
-            position = player.currentPosition
-            val bucket = position / 5000
-            if (bucket != lastReported) {
-                Log.i(PLAYBACK_TAG, "progress position_ms=" + position)
-                lastReported = bucket
+    DisposableEffect(controller, fullScreen, landscape) {
+        controller.systemBarsBehavior = if (fullScreen) {
+            WindowInsetsControllerCompat.BEHAVIOR_SHOW_TRANSIENT_BARS_BY_SWIPE
+        } else originalBarsBehavior
+        fun applyVisibility(types: Int) {
+            if (types != 0) {
+                if (fullScreen) controller.hide(types) else controller.show(types)
             }
-            delay(500)
+        }
+        // Rotation can transfer bar control after the windowed layout is already on screen.
+        val listener = WindowInsetsControllerCompat.OnControllableInsetsChangedListener { _, types ->
+            applyVisibility(types and bars)
+        }
+        controller.addOnControllableInsetsChangedListener(listener)
+        applyVisibility(bars)
+        onDispose { controller.removeOnControllableInsetsChangedListener(listener) }
+    }
+    LaunchedEffect(session, fullScreen, session.playing, controlsVisible, scrubbing, choosingEpisode, controlsTimeout) {
+        if (fullScreen && session.playing && controlsVisible && !scrubbing && !choosingEpisode) {
+            delay(controlsTimeout)
+            controlsVisible = false
         }
     }
-    Column(
-        modifier = Modifier.fillMaxSize().windowInsetsPadding(WindowInsets.safeDrawing)
-            .verticalScroll(rememberScrollState()).padding(16.dp),
-        verticalArrangement = Arrangement.spacedBy(8.dp),
-    ) {
-        TextButton(onClick = onBack) { Text("返回") }
-        Text(title, style = MaterialTheme.typography.titleLarge)
-        AndroidView(
-            factory = { PlayerView(it) },
-            update = { it.player = livePlayer },
-            onRelease = { it.player = null },
-            modifier = Modifier.fillMaxWidth().aspectRatio(16f / 9f),
+    val setFullScreen: (Boolean) -> Unit = { enter ->
+        fullScreen = enter
+        controlsVisible = true
+        activity.requestedOrientation = if (enter) ActivityInfo.SCREEN_ORIENTATION_SENSOR_LANDSCAPE else originalOrientation
+    }
+    val back = { if (fullScreen) setFullScreen(false) else onBack() }
+    BackHandler(onBack = back)
+
+    val controls: @Composable () -> Unit = {
+        PlaybackControls(session, episodeNames.size, episodeIndex, onEpisode,
+            onChoose = { choosingEpisode = true }, onScrub = { scrubbing = it })
+    }
+    if (fullScreen) {
+        Box(Modifier.fillMaxSize().background(Color.Black)) {
+            PlaybackVideo(session, Modifier.fillMaxSize())
+            Box(Modifier.matchParentSize().clickable(
+                onClickLabel = if (controlsVisible) "隐藏播放控件" else "显示播放控件",
+                onClick = { controlsVisible = !controlsVisible },
+            ).semantics { contentDescription = "播放画面" })
+            if (controlsVisible || !session.playing) {
+                Column(
+                    Modifier.align(Alignment.BottomCenter).fillMaxWidth()
+                        .background(Color.Black.copy(alpha = 0.82f))
+                        .windowInsetsPadding(WindowInsets.safeDrawing)
+                        .padding(horizontal = 12.dp),
+                ) {
+                    CompositionLocalProvider(LocalContentColor provides Color.White) {
+                        Row(verticalAlignment = Alignment.CenterVertically) {
+                            Text(title, Modifier.weight(1f), maxLines = 1, overflow = TextOverflow.Ellipsis)
+                            PlayerIcon("退出全屏", MediaR.drawable.exo_ic_fullscreen_exit) { setFullScreen(false) }
+                        }
+                        Text(session.failure ?: session.status, maxLines = 2, overflow = TextOverflow.Ellipsis)
+                        controls()
+                    }
+                }
+            }
+        }
+    } else {
+        Surface(Modifier.fillMaxSize()) {
+            Column(Modifier.windowInsetsPadding(WindowInsets.safeDrawing).verticalScroll(rememberScrollState())) {
+                Row(Modifier.fillMaxWidth().padding(horizontal = 8.dp), verticalAlignment = Alignment.CenterVertically) {
+                    TextButton(onClick = back) { Text("返回") }
+                    Text(title, Modifier.weight(1f), style = MaterialTheme.typography.titleMedium)
+                    PlayerIcon("全屏", MediaR.drawable.exo_ic_fullscreen_enter) { setFullScreen(true) }
+                }
+                PlaybackVideo(session, Modifier.fillMaxWidth().aspectRatio(16f / 9f))
+                Column(Modifier.padding(horizontal = 16.dp, vertical = 8.dp)) {
+                    Text(session.failure ?: session.status, style = MaterialTheme.typography.titleMedium)
+                    controls()
+                    HorizontalDivider(Modifier.padding(vertical = 8.dp))
+                    val audio = when {
+                        session.audioAdvanced -> "已输出"
+                        session.audioTrack -> "已选择"
+                        else -> "等待"
+                    }
+                    Text("首帧 " + (if (session.firstFrame) "已显示" else "等待") + "  ·  音轨 " + audio,
+                        style = MaterialTheme.typography.bodySmall)
+                    Text("清单 " + session.manifests + "  ·  媒体加载 " + session.mediaLoads,
+                        style = MaterialTheme.typography.bodySmall)
+                }
+            }
+        }
+    }
+    if (choosingEpisode && episodeNames.isNotEmpty()) {
+        AlertDialog(
+            onDismissRequest = { choosingEpisode = false },
+            title = { Text("选择剧集") },
+            text = {
+                val listState = rememberLazyListState(initialFirstVisibleItemIndex = episodeIndex.coerceIn(episodeNames.indices))
+                LazyColumn(state = listState, modifier = Modifier.heightIn(max = 360.dp)) {
+                    items(episodeNames.size) { index ->
+                        val current = index == episodeIndex
+                        TextButton(
+                            modifier = Modifier.fillMaxWidth(), onClick = {
+                                choosingEpisode = false
+                                if (!current) onEpisode(index)
+                            },
+                        ) {
+                            Text(episodeNames[index] + if (current) " · 当前" else "", Modifier.weight(1f))
+                        }
+                    }
+                }
+            },
+            confirmButton = { TextButton(onClick = { choosingEpisode = false }) { Text("关闭") } },
         )
-        Text(failure ?: if (isPlaying) "播放中" else status)
-        Text("清单 " + manifests + "  ·  媒体加载 " + mediaLoads + "  ·  位置 " + position / 1000 + " 秒")
-        val audio = when {
-            audioAdvanced -> "已输出"
-            audioTrack -> "已选择"
-            else -> "等待"
+    }
+}
+
+@androidx.annotation.OptIn(UnstableApi::class)
+@Composable
+private fun PlaybackVideo(session: PlaybackSession, modifier: Modifier) {
+    AndroidView(
+        factory = { context ->
+            PlayerView(context).apply {
+                useController = false
+                resizeMode = AspectRatioFrameLayout.RESIZE_MODE_FIT
+                setBackgroundColor(android.graphics.Color.BLACK)
+            }
+        },
+        update = { view ->
+            if (view.player !== session.player) view.player = session.player
+            view.keepScreenOn = session.wantsPlay && session.phase != PlaybackPhase.ENDED && session.failure == null
+        },
+        onRelease = { it.keepScreenOn = false; it.player = null },
+        modifier = modifier,
+    )
+}
+
+@androidx.annotation.OptIn(UnstableApi::class)
+@Composable
+private fun PlaybackControls(
+    session: PlaybackSession, count: Int, index: Int, onEpisode: (Int) -> Unit,
+    onChoose: () -> Unit, onScrub: (Boolean) -> Unit,
+) {
+    var drag by remember(session) { mutableStateOf<Float?>(null) }
+    val duration = session.durationMs
+    val fraction = drag ?: if (duration > 0) (session.positionMs.toDouble() / duration).toFloat().coerceIn(0f, 1f) else 0f
+    DisposableEffect(session) { onDispose { onScrub(false) } }
+    Slider(
+        value = fraction,
+        enabled = session.canSeek && duration > 0 && session.failure == null,
+        onValueChange = { drag = it; onScrub(true) },
+        onValueChangeFinished = {
+            drag?.let { session.seekTo((duration * it.toDouble()).toLong()) }
+            drag = null
+            onScrub(false)
+        },
+        modifier = Modifier.fillMaxWidth().semantics { contentDescription = "播放进度" },
+    )
+    Text(clockText(drag?.let { (duration * it.toDouble()).toLong() } ?: session.positionMs) +
+        " / " + if (duration > 0) clockText(duration) else "--:--",
+        style = MaterialTheme.typography.labelMedium)
+    Row(Modifier.horizontalScroll(rememberScrollState()), verticalAlignment = Alignment.CenterVertically) {
+        if (session.failure != null) {
+            if (session.valid) TextButton(onClick = session::retry) { Text("重试") }
+        } else {
+            val ended = session.phase == PlaybackPhase.ENDED
+            val pause = session.wantsPlay && !ended
+            PlayerIcon(if (ended) "重播" else if (pause) "暂停" else "播放",
+                if (pause) MediaR.drawable.exo_ic_pause_circle_filled else MediaR.drawable.exo_ic_play_circle_filled,
+                enabled = session.player != null, onClick = session::togglePlay)
         }
-        Text("首帧 " + (if (firstFrame) "已显示" else "等待") + "  ·  音轨 " + audio)
-        if (failure != null && valid) {
-            Button(onClick = { resume = true; attempt++ }) { Text("重试") }
+        if (count > 0) {
+            PlayerIcon("上一集", MediaR.drawable.exo_ic_skip_previous, enabled = index > 0) { onEpisode(index - 1) }
+            PlayerIcon("下一集", MediaR.drawable.exo_ic_skip_next, enabled = index < count - 1) { onEpisode(index + 1) }
+            TextButton(onClick = onChoose) { Text("选集") }
         }
     }
+}
+
+@Composable
+private fun PlayerIcon(label: String, drawable: Int, enabled: Boolean = true, onClick: () -> Unit) {
+    IconButton(onClick = onClick, enabled = enabled, modifier = Modifier.size(48.dp)) {
+        Icon(painterResource(drawable), contentDescription = label)
+    }
+}
+
+private fun clockText(milliseconds: Long): String {
+    val seconds = milliseconds.coerceAtLeast(0) / 1000
+    return if (seconds < 3600) String.format(Locale.ROOT, "%d:%02d", seconds / 60, seconds % 60)
+    else String.format(Locale.ROOT, "%d:%02d:%02d", seconds / 3600, seconds / 60 % 60, seconds % 60)
 }
