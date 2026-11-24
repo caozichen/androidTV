@@ -1,6 +1,5 @@
 package dev.libretv.android
 
-import android.app.Application
 import androidx.activity.compose.BackHandler
 import androidx.compose.foundation.layout.*
 import androidx.compose.foundation.lazy.LazyColumn
@@ -8,117 +7,16 @@ import androidx.compose.foundation.lazy.items
 import androidx.compose.foundation.lazy.rememberLazyListState
 import androidx.compose.material3.*
 import androidx.compose.runtime.*
+import androidx.compose.runtime.saveable.rememberSaveable
 import androidx.compose.ui.Modifier
 import androidx.compose.ui.unit.dp
-import androidx.lifecycle.viewModelScope
-import kotlinx.coroutines.CancellationException
-import kotlinx.coroutines.Job
-import kotlinx.coroutines.coroutineScope
-import kotlinx.coroutines.launch
-
-private const val SAMPLE = "航拍中国"
-internal data class FilmHit(val source: CmsSource, val film: Film)
-
-internal class CatalogState(app: Application) : SourceManagerState(app) {
-    val sources get() = managerRows.map { CmsSource(it.name, it.url) }
-    val selected get() = managerRows.filter { it.enabled }.map { CmsSource(it.name, it.url) }.toSet()
-    var managing by mutableStateOf(false)
-    var query by mutableStateOf(SAMPLE)
-    var notice by mutableStateOf("")
-        private set
-    var searching by mutableStateOf(false)
-        private set
-    val groups = mutableStateMapOf<CmsSource, List<Film>>()
-    val errors = mutableStateMapOf<CmsSource, String>()
-    var detail by mutableStateOf<FilmHit?>(null)
-        private set
-    var lines by mutableStateOf(emptyList<PlayLine>())
-        private set
-    var lineIndex by mutableIntStateOf(0)
-    var detailStatus by mutableStateOf("")
-        private set
-    var player by mutableStateOf<Pair<String, String>?>(null)
-    var environment by mutableStateOf(false)
-    private var request: Job? = null
-    private var detailsRequest: Job? = null
-    init { refreshSources() }
-    override fun onSourcesChanged() = clearSearch()
-
-    private fun clearSearch() {
-        request?.cancel()
-        searching = false
-        groups.clear()
-        errors.clear()
-        notice = ""
-    }
-
-    fun search(keyword: String = query) {
-        if (busy) return
-        if (selected.isEmpty()) {
-            managing = true
-            return
-        }
-        clearSearch()
-        query = keyword.trim()
-        if (query.isBlank() || query.length > 100) {
-            notice = "搜索词应为 1 至 100 个字符"
-            return
-        }
-        val term = query
-        val targets = sources.filter { it in selected }
-        searching = true
-        request = viewModelScope.launch {
-            coroutineScope {
-                for (source in targets) launch {
-                    try {
-                        groups[source] = searchCatalog(source, term)
-                    } catch (e: CancellationException) {
-                        throw e
-                    } catch (e: Exception) {
-                        errors[source] = catalogErrorText(e)
-                    }
-                }
-            }
-            searching = false
-            notice = if (groups.values.all { it.isEmpty() } && errors.isEmpty()) "未找到匹配影片" else ""
-        }
-    }
-
-    fun open(hit: FilmHit) {
-        detailsRequest?.cancel()
-        detail = hit
-        lines = emptyList()
-        lineIndex = 0
-        detailStatus = "正在加载剧集…"
-        detailsRequest = viewModelScope.launch {
-            try {
-                lines = loadLines(hit.source, hit.film.id)
-                detailStatus = if (lines.isEmpty()) "此来源暂无可播放的 HTTPS 剧集" else ""
-            } catch (e: CancellationException) {
-                throw e
-            } catch (e: Exception) {
-                detailStatus = catalogErrorText(e)
-            }
-        }
-    }
-
-    fun back() {
-        when {
-            player != null -> player = null
-            managing -> { closeManager(); managing = false }
-            environment -> environment = false
-            else -> {
-                detailsRequest?.cancel()
-                detail = null
-            }
-        }
-    }
-}
 
 @Composable
 internal fun CatalogScreen(state: CatalogState) {
     val homeScroll = rememberLazyListState()
-    val detailScroll = key(state.detail) { rememberLazyListState() }
+    val detailScroll = key(state.detail?.ref) { rememberLazyListState() }
+    var showSources by rememberSaveable { mutableStateOf(false) }
+    var showProgress by rememberSaveable { mutableStateOf(false) }
     val player = state.player
     val hit = state.detail
     BackHandler(enabled = player == null && (hit != null || state.environment), onBack = state::back)
@@ -141,70 +39,109 @@ internal fun CatalogScreen(state: CatalogState) {
                         }
                     }
                     item {
-                        OutlinedTextField(
-                            value = state.query, onValueChange = { state.query = it.take(100) },
-                            modifier = Modifier.fillMaxWidth(), singleLine = true, label = { Text("片名") },
-                        )
+                        OutlinedTextField(value = state.query, onValueChange = { state.query = it.take(100) },
+                            modifier = Modifier.fillMaxWidth(), singleLine = true, label = { Text("片名") })
                     }
                     item {
                         Row(horizontalArrangement = Arrangement.spacedBy(8.dp)) {
                             Button(onClick = { state.search() }, enabled = !state.busy) { Text("搜索") }
                             TextButton(onClick = { state.search(SAMPLE) }, enabled = !state.busy) { Text(SAMPLE) }
+                            if (state.searching) TextButton(onClick = state::stopSearch) { Text("取消搜索") }
                         }
                     }
                     item {
                         Row(Modifier.fillMaxWidth(), horizontalArrangement = Arrangement.SpaceBetween) {
-                            TextButton(onClick = { state.managing = true }) { Text(if (state.sources.isEmpty()) "添加点播源" else "点播源管理") }
+                            TextButton(onClick = { state.managing = true }) { Text(if (state.managerRows.isEmpty()) "添加点播源" else "点播源管理") }
                             TextButton(onClick = { state.player = "HLS 对照样片" to CONTROL_HLS_URL }) { Text("播放对照样片") }
                         }
                     }
-                    if (state.sources.isNotEmpty()) {
-                        item { Text("搜索片源", style = MaterialTheme.typography.titleMedium) }
-                        items(state.managerRows, key = { "source:${it.id}" }) { source ->
-                            FilterChip(selected = source.enabled, enabled = !state.busy, onClick = { state.setEnabled(source.id, !source.enabled) }, label = { Text(source.name) })
+                    if (state.managerRows.isNotEmpty()) {
+                        item {
+                            TextButton(onClick = { showSources = !showSources }) {
+                                Text("搜索片源 · 已启用 ${state.managerRows.count { it.enabled }} / ${state.managerRows.size}")
+                            }
+                        }
+                        if (showSources) item {
+                            Row(verticalAlignment = androidx.compose.ui.Alignment.CenterVertically) {
+                                Checkbox(checked = state.filterAdult, onCheckedChange = state::updateFilter)
+                                Text("过滤成人源及成人分类")
+                            }
+                        }
+                        if (showSources) items(state.managerRows, key = { "source:${it.id}" }) { source ->
+                            FilterChip(selected = source.enabled, enabled = !state.busy,
+                                onClick = { state.setEnabled(source.id, !source.enabled) },
+                                label = { Text(if (source.isAdult) "${source.name}（成人源）" else source.name) })
                         }
                     }
-                    if (state.searching) item { LinearProgressIndicator(Modifier.fillMaxWidth()) }
+                    if (state.searching) item {
+                        LinearProgressIndicator(Modifier.fillMaxWidth())
+                        Text("搜索中 · 已完成 ${state.updates.values.count { it.done }} / ${state.updates.size} 个片源")
+                    }
                     if (state.notice.isNotBlank()) item { Text(state.notice) }
-                    for (source in state.sources) {
-                        val films = state.groups[source]
-                        val error = state.errors[source]
-                        if (films != null || error != null) {
-                            item {
-                                HorizontalDivider()
-                                Text("${source.name} · ${error ?: "${films.orEmpty().size} 个结果"}", style = MaterialTheme.typography.titleSmall)
-                            }
-                            items(films.orEmpty(), key = { "film:${source.url}:${it.id}" }) { film ->
-                                TextButton(onClick = { state.open(FilmHit(source, film)) }) {
-                                    Text(listOf(film.title, film.year).filter { it.isNotBlank() }.joinToString(" · "))
-                                }
-                            }
+                    if (state.updates.isNotEmpty()) item {
+                        Row {
+                            TextButton(onClick = { showProgress = !showProgress }) { Text("各源状态") }
+                            if (!state.searching) TextButton(onClick = { state.search(state.searchedTerm, refresh = true) }) { Text("重新搜索") }
                         }
+                    }
+                    if (showProgress || state.hits.isEmpty()) items(state.updates.values.toList(), key = { "status:${it.source.id}" }) { u ->
+                        val outcome = u.error ?: when {
+                            u.done -> "完成"
+                            state.searching -> "加载中"
+                            else -> "已取消"
+                        }
+                        Text("${u.source.name} · ${u.pages} 页 · ${u.films.size} 条 · $outcome", style = MaterialTheme.typography.bodySmall)
+                    }
+                    items(state.hits, key = { "film:${it.source.id}:${it.film.id}" }) { entry ->
+                        FilmButton(entry, state.sourceLabel(entry)) { state.open(entry) }
                     }
                 } else {
-                    item { TextButton(onClick = state::back) { Text("返回搜索") } }
+                    item { TextButton(onClick = state::back) { Text(if (state.choosingSource) "返回详情" else "返回搜索") } }
                     item { Text(hit.film.title, style = MaterialTheme.typography.headlineSmall) }
-                    item { Text(listOf(hit.source.name, hit.film.year).filter { it.isNotBlank() }.joinToString(" · ")) }
-                    if (state.detailStatus.isNotBlank()) {
-                        item { Text(state.detailStatus) }
-                        if (state.lines.isEmpty() && state.detailStatus != "正在加载剧集…") {
-                            item { TextButton(onClick = { state.open(hit) }) { Text("重新加载") } }
+                    item { Text(listOf(state.sourceLabel(hit), hit.film.year, hit.film.category).filter { it.isNotBlank() }.joinToString(" · ")) }
+                    if (state.choosingSource) {
+                        item { Text("选择其他来源", style = MaterialTheme.typography.titleMedium) }
+                        val options = state.sourceOptions()
+                        if (options.isEmpty()) item { Text(if (state.searching) "正在等待其他片源" else "当前搜索没有其他来源，请返回搜索调整关键词或片源") }
+                        items(options, key = { "switch:${it.source.id}:${it.film.id}" }) { option ->
+                            FilmButton(option, state.sourceLabel(option)) { state.open(option, switch = true) }
                         }
-                    }
-                    if (state.lines.isNotEmpty()) {
-                        item { Text("播放线路", style = MaterialTheme.typography.titleMedium) }
-                        items(state.lines.size) { index ->
-                            FilterChip(selected = state.lineIndex == index, onClick = { state.lineIndex = index }, label = { Text(state.lines[index].name) })
+                    } else {
+                        item { TextButton(onClick = { state.choosingSource = true }) { Text("换源") } }
+                        if (state.detailStatus.isNotBlank()) item { Text(state.detailStatus) }
+                        if (!state.loadingDetail && state.lines.isEmpty()) item {
+                            TextButton(onClick = { state.open(hit, refresh = true) }) { Text("重新加载") }
                         }
-                        item { Text("选择剧集", style = MaterialTheme.typography.titleMedium) }
-                        items(state.lines[state.lineIndex].episodes) { ep ->
-                            OutlinedButton(onClick = { state.player = "${hit.film.title} · ${ep.name}" to ep.url }) {
-                                Text(ep.name)
+                        if (state.lines.isNotEmpty()) {
+                            item { Text("播放线路", style = MaterialTheme.typography.titleMedium) }
+                            items(state.lines.size) { index ->
+                                FilterChip(selected = state.lineIndex == index, onClick = { state.selectLine(index) }, label = { Text(state.lines[index].name) })
+                            }
+                            item { Text("选择剧集", style = MaterialTheme.typography.titleMedium) }
+                            items(state.lines[state.lineIndex].episodes.size) { index ->
+                                val ep = state.lines[state.lineIndex].episodes[index]
+                                OutlinedButton(onClick = { state.play(index) }) {
+                                    Text(if (state.lastEpisode != null && state.lastEpisode == state.episodeRef(index)) "${ep.name} · 已选" else ep.name)
+                                }
                             }
                         }
                     }
                 }
             }
+        }
+    }
+}
+
+private fun CatalogState.sourceLabel(hit: FilmHit): String =
+    if (managerRows.count { it.name == hit.source.name } > 1) "${hit.source.name} · ${hit.source.id.take(6)}" else hit.source.name
+
+@Composable
+private fun FilmButton(hit: FilmHit, sourceLabel: String, onClick: () -> Unit) {
+    TextButton(onClick = onClick, modifier = Modifier.fillMaxWidth()) {
+        Column(Modifier.fillMaxWidth()) {
+            Text(hit.film.title, style = MaterialTheme.typography.titleMedium)
+            Text(listOf(sourceLabel, hit.film.year, hit.film.category).filter { it.isNotBlank() }.joinToString(" · "),
+                style = MaterialTheme.typography.bodySmall)
         }
     }
 }

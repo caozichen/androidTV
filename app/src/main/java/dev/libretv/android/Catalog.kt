@@ -20,9 +20,9 @@ import org.json.JSONArray
 import org.json.JSONException
 import org.json.JSONObject
 
-data class CmsSource(val name: String, val url: String)
-data class Film(val id: String, val title: String, val year: String)
-data class Episode(val name: String, val url: String)
+data class CmsSource(val name: String, val url: String, val id: String = url)
+data class Film(val id: String, val title: String, val year: String, val category: String = "")
+data class Episode(val name: String, val url: String, val explicitLabel: Boolean = true)
 data class PlayLine(val name: String, val episodes: List<Episode>)
 
 private const val MAX_BYTES = 4L * 1024 * 1024
@@ -44,7 +44,8 @@ internal fun catalogErrorText(error: Exception): String = when (error) {
     else -> "请求失败，请重试或换源"
 }
 
-private val client = OkHttpClient.Builder()
+internal val catalogClient = OkHttpClient.Builder()
+    .dispatcher(okhttp3.Dispatcher().apply { maxRequests = 4; maxRequestsPerHost = 4 })
     .connectTimeout(8, TimeUnit.SECONDS)
     .readTimeout(10, TimeUnit.SECONDS)
     .callTimeout(12, TimeUnit.SECONDS)
@@ -53,22 +54,31 @@ private val client = OkHttpClient.Builder()
 
 internal suspend fun checkCatalog(source: CmsSource) {
     val json = fetchCatalog(catalogUrl(source, mapOf("pg" to "1")))
-    withContext(Dispatchers.Default) { resultList(json) }
+    withContext(Dispatchers.Default) { resultList(JSONObject(json)) }
 }
 
 suspend fun searchCatalog(source: CmsSource, query: String): List<Film> {
     val keyword = query.trim()
     require(keyword.isNotEmpty() && keyword.length <= 100) { "搜索词应为 1 至 100 个字符" }
-    val url = catalogUrl(source, mapOf("wd" to keyword, "pg" to "1"))
-    val json = fetchCatalog(url)
-    return withContext(Dispatchers.Default) { parseFilms(json) }
+    return rankFilms(fetchSearchPage(source, keyword, 1).films, keyword)
 }
 
-suspend fun loadLines(source: CmsSource, id: String): List<PlayLine> {
+internal suspend fun fetchSearchPage(source: CmsSource, keyword: String, page: Int): CatalogPage {
+    val json = fetchCatalog(catalogUrl(source, mapOf("wd" to keyword, "pg" to page.toString())))
+    return withContext(Dispatchers.Default) { parseCatalogPage(json) }
+}
+
+internal data class CatalogDetail(val film: Film?, val lines: List<PlayLine>) {
+    fun confirms(expected: Film): Boolean = film != null && film.id == expected.id &&
+        film.year.isNotBlank() && film.year == expected.year && film.title.isNotBlank() &&
+        normalizeCatalogTitle(film.title) == normalizeCatalogTitle(expected.title)
+}
+
+internal suspend fun loadCatalogDetail(source: CmsSource, id: String): CatalogDetail {
     require(id.isNotBlank()) { "影片标识为空" }
     val url = catalogUrl(source, mapOf("ids" to id))
     val json = fetchCatalog(url)
-    return withContext(Dispatchers.Default) { parseLines(json, id) }
+    return withContext(Dispatchers.Default) { parseCatalogDetail(json, id) }
 }
 
 internal fun catalogUrl(source: CmsSource, parameters: Map<String, String>): HttpUrl {
@@ -84,7 +94,7 @@ internal fun catalogUrl(source: CmsSource, parameters: Map<String, String>): Htt
     }.build()
 }
 
-private suspend fun fetchCatalog(url: HttpUrl): String = suspendCancellableCoroutine { continuation ->
+internal suspend fun fetchCatalog(url: HttpUrl, client: OkHttpClient = catalogClient): String = suspendCancellableCoroutine { continuation ->
     val request = Request.Builder().url(url).header("Accept", "application/json").build()
     val call = client.newCall(request)
     continuation.invokeOnCancellation { call.cancel() }
@@ -112,8 +122,7 @@ internal fun readCatalogResponse(response: Response): String {
     return body.string().removePrefix("\uFEFF")
 }
 
-private fun resultList(json: String): JSONArray {
-    val root = JSONObject(json)
+private fun resultList(root: JSONObject): JSONArray {
     if (root.has("code") && root.optString("code") == "0") throw CatalogResponseError("点播源返回业务错误，请重试或换源")
     if (!root.has("list")) throw JSONException("点播源缺少 list 字段")
     if (root.isNull("list")) return JSONArray()
@@ -124,24 +133,31 @@ private fun JSONObject.field(name: String): String =
     if (isNull(name)) "" else optString(name).trim()
 
 internal fun parseFilms(json: String): List<Film> {
-    val rows = resultList(json)
+    return parseCatalogPage(json).films
+}
+
+internal fun parseCatalogPage(json: String): CatalogPage {
+    val root = JSONObject(json)
+    val rows = resultList(root)
     val films = linkedMapOf<String, Film>()
     for (index in 0 until rows.length()) {
         val row = rows.optJSONObject(index) ?: continue
         val id = row.field("vod_id")
         val title = row.field("vod_name")
         if (id.isNotEmpty() && title.isNotEmpty() && id !in films) {
-            films[id] = Film(id, title, row.field("vod_year"))
+            films[id] = Film(id, title, row.field("vod_year"), row.field("type_name"))
         }
     }
-    return films.values.toList()
+    return CatalogPage(films.values.toList(), root.optInt("pagecount", 1).coerceIn(1, 5))
 }
 
-internal fun parseLines(json: String, id: String): List<PlayLine> {
-    val rows = resultList(json)
+internal fun parseLines(json: String, id: String): List<PlayLine> = parseCatalogDetail(json, id).lines
+
+internal fun parseCatalogDetail(json: String, id: String): CatalogDetail {
+    val rows = resultList(JSONObject(json))
     val film = (0 until rows.length()).asSequence().mapNotNull { rows.optJSONObject(it) }
         .firstOrNull { it.field("vod_id") == id || (rows.length() == 1 && it.field("vod_id").isEmpty()) }
-        ?: return emptyList()
+        ?: return CatalogDetail(null, emptyList())
     val names = film.field("vod_play_from").split("$$$")
     val lines = film.field("vod_play_url").split("$$$").mapIndexedNotNull { index, group ->
         val episodes = group.split('#').mapIndexedNotNull { position, raw -> parseEpisode(position, raw) }
@@ -149,7 +165,7 @@ internal fun parseLines(json: String, id: String): List<PlayLine> {
         val name = names.getOrNull(index)?.trim().orEmpty().ifEmpty { "线路 ${index + 1}" }
         PlayLine(name, episodes)
     }
-    return lines
+    return CatalogDetail(Film(film.field("vod_id"), film.field("vod_name"), film.field("vod_year"), film.field("type_name")), lines)
 }
 
 private fun parseEpisode(index: Int, raw: String): Episode? {
@@ -161,5 +177,5 @@ private fun parseEpisode(index: Int, raw: String): Episode? {
     val path = url.encodedPath.lowercase()
     val directMedia = path.endsWith(".m3u8") || path.endsWith(".mp4")
     if (path.endsWith(".html") || path.endsWith(".htm") || (path.startsWith("/share/") && !directMedia)) return null
-    return Episode(label.ifEmpty { "第 ${index + 1} 集" }, url.toString())
+    return Episode(label.ifEmpty { "第 ${index + 1} 集" }, url.toString(), explicitLabel = label.isNotEmpty())
 }

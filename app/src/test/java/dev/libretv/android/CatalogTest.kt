@@ -51,12 +51,24 @@ class CatalogTest {
         assertEquals(listOf("高清", "备用"), lines.map { it.name })
         assertEquals(listOf("第一集", "第二集"), lines.first().episodes.map { it.name })
         assertEquals("https://media.example.org/a/master.m3u8?sig=x\$y", lines.first().episodes.first().url)
-        assertEquals(Episode("第 1 集", "https://media.example.org/c.mp4"), lines.last().episodes.single())
+        assertEquals(Episode("第 1 集", "https://media.example.org/c.mp4", explicitLabel = false), lines.last().episodes.single())
     }
 
     @Test fun mismatchedMovieOrMissingPlaybackReturnsNoLines() {
         assertTrue(parseLines(fixture("detail"), "18").isEmpty())
         assertTrue(parseLines("""{"list":[{"vod_id":"17","vod_play_url":null}]}""", "17").isEmpty())
+    }
+
+    @Test fun freshDetailsMustConfirmIdentityBeforeSuggestingAnEpisode() {
+        val expected = Film("17", "海岸第一季", "2022")
+        val detail = parseCatalogDetail("""{"list":[{"vod_id":17,"vod_name":"海岸第一季","vod_year":"2022"}]}""", "17")
+        assertTrue(detail.confirms(expected))
+        assertTrue(!detail.confirms(expected.copy(title = "海岸第二季")))
+        assertTrue(!detail.confirms(expected.copy(year = "2021")))
+        assertTrue(!detail.confirms(expected.copy(id = "18")))
+        val incomplete = parseCatalogDetail("""{"list":[{"vod_play_url":"https://media.example.org/a.mp4"}]}""", "17")
+        assertTrue(incomplete.lines.isNotEmpty())
+        assertTrue(!incomplete.confirms(expected))
     }
 
     @Test fun oversizedChunkedResponseAndHttpFailureAreRejected() {
