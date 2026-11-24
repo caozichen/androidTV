@@ -1,0 +1,7 @@
+{
+  "sources": [
+    {"name": "缺少地址"},
+    {"name": "明文协议", "url": "http://catalog.example.org/vod"},
+    {"name": "无效详情地址", "url": "https://catalog.example.org/vod", "detail": "invalid-address"}
+  ]
+}

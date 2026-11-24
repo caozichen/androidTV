@@ -51,6 +51,11 @@ private val client = OkHttpClient.Builder()
     .followSslRedirects(false)
     .build()
 
+internal suspend fun checkCatalog(source: CmsSource) {
+    val json = fetchCatalog(catalogUrl(source, mapOf("pg" to "1")))
+    withContext(Dispatchers.Default) { resultList(json) }
+}
+
 suspend fun searchCatalog(source: CmsSource, query: String): List<Film> {
     val keyword = query.trim()
     require(keyword.isNotEmpty() && keyword.length <= 100) { "搜索词应为 1 至 100 个字符" }

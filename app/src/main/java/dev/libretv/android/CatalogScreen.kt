@@ -1,10 +1,7 @@
 package dev.libretv.android
 
 import android.app.Application
-import android.net.Uri
 import androidx.activity.compose.BackHandler
-import androidx.activity.compose.rememberLauncherForActivityResult
-import androidx.activity.result.contract.ActivityResultContracts
 import androidx.compose.foundation.layout.*
 import androidx.compose.foundation.lazy.LazyColumn
 import androidx.compose.foundation.lazy.items
@@ -13,53 +10,19 @@ import androidx.compose.material3.*
 import androidx.compose.runtime.*
 import androidx.compose.ui.Modifier
 import androidx.compose.ui.unit.dp
-import androidx.lifecycle.AndroidViewModel
 import androidx.lifecycle.viewModelScope
-import java.io.ByteArrayOutputStream
 import kotlinx.coroutines.CancellationException
-import kotlinx.coroutines.Dispatchers
 import kotlinx.coroutines.Job
 import kotlinx.coroutines.coroutineScope
 import kotlinx.coroutines.launch
-import kotlinx.coroutines.withContext
-import org.json.JSONArray
-import org.json.JSONObject
 
 private const val SAMPLE = "航拍中国"
-private const val LIMIT = 128 * 1024
 internal data class FilmHit(val source: CmsSource, val film: Film)
 
-internal fun selectionAfterImport(
-    previous: List<CmsSource>, enabled: Set<CmsSource>, updated: List<CmsSource>,
-): Set<CmsSource> {
-    val existingUrls = previous.map { it.url }.toSet()
-    val enabledUrls = enabled.map { it.url }.toSet()
-    return updated.filterTo(mutableSetOf()) { it.url !in existingUrls || it.url in enabledUrls }
-}
-
-private fun decodeSources(text: String): List<CmsSource> {
-    val rows = JSONObject(text.removePrefix("\uFEFF")).getJSONArray("sources")
-    require(rows.length() in 1..50)
-    val entries = (0 until rows.length()).map { index ->
-        val item = rows.getJSONObject(index)
-        val name = item.getString("name").trim()
-        val address = item.getString("url").trim()
-        require(name.isNotBlank() && name.length <= 80 && address.length <= 4096)
-        CmsSource(name, address).also { catalogUrl(it, emptyMap()) }
-    }
-    return entries.distinctBy { it.url }
-}
-
-internal class CatalogState(private val app: Application) : AndroidViewModel(app) {
-    private val prefs = app.getSharedPreferences("catalog-sources", 0)
-    var sources by mutableStateOf(
-        runCatching { decodeSources(prefs.getString("list", "").orEmpty()) }.getOrDefault(emptyList())
-    )
-        private set
-    var selected by mutableStateOf(
-        sources.filter { it.url in (prefs.getStringSet("selected", null) ?: sources.map { s -> s.url }.toSet()) }.toSet()
-    )
-        private set
+internal class CatalogState(app: Application) : SourceManagerState(app) {
+    val sources get() = managerRows.map { CmsSource(it.name, it.url) }
+    val selected get() = managerRows.filter { it.enabled }.map { CmsSource(it.name, it.url) }.toSet()
+    var managing by mutableStateOf(false)
     var query by mutableStateOf(SAMPLE)
     var notice by mutableStateOf("")
         private set
@@ -78,43 +41,8 @@ internal class CatalogState(private val app: Application) : AndroidViewModel(app
     var environment by mutableStateOf(false)
     private var request: Job? = null
     private var detailsRequest: Job? = null
-    private var importJob: Job? = null
-
-    fun importDocument(uri: Uri) {
-        importJob?.cancel()
-        importJob = viewModelScope.launch {
-            try {
-                val imported = withContext(Dispatchers.IO) {
-                    val raw = requireNotNull(app.contentResolver.openInputStream(uri)).use { input ->
-                        val output = ByteArrayOutputStream()
-                        val buffer = ByteArray(8192)
-                        while (true) {
-                            val count = input.read(buffer)
-                            if (count < 0) break
-                            require(output.size() + count <= LIMIT)
-                            output.write(buffer, 0, count)
-                        }
-                        output.toString("UTF-8")
-                    }
-                    decodeSources(raw)
-                }
-                val updated = (imported + sources).distinctBy { it.url }
-                require(updated.size <= 50)
-                clearSearch()
-                selected = selectionAfterImport(sources, selected, updated)
-                sources = updated
-                val rows = JSONArray()
-                for (source in updated) rows.put(JSONObject().put("name", source.name).put("url", source.url))
-                prefs.edit().putString("list", JSONObject().put("sources", rows).toString())
-                    .putStringSet("selected", selected.map { it.url }.toSet()).apply()
-                notice = "已导入 ${imported.size} 个片源"
-            } catch (e: CancellationException) {
-                throw e
-            } catch (_: Exception) {
-                notice = "导入失败，请检查 JSON 格式、文件大小和 HTTPS 地址"
-            }
-        }
-    }
+    init { refreshSources() }
+    override fun onSourcesChanged() = clearSearch()
 
     private fun clearSearch() {
         request?.cancel()
@@ -124,17 +52,16 @@ internal class CatalogState(private val app: Application) : AndroidViewModel(app
         notice = ""
     }
 
-    fun toggle(source: CmsSource) {
-        clearSearch()
-        selected = if (source in selected) selected - source else selected + source
-        prefs.edit().putStringSet("selected", selected.map { it.url }.toSet()).apply()
-    }
-
     fun search(keyword: String = query) {
+        if (busy) return
+        if (selected.isEmpty()) {
+            managing = true
+            return
+        }
         clearSearch()
         query = keyword.trim()
-        if (selected.isEmpty() || query.isBlank() || query.length > 100) {
-            notice = if (selected.isEmpty()) "请先导入并选择片源" else "搜索词应为 1 至 100 个字符"
+        if (query.isBlank() || query.length > 100) {
+            notice = "搜索词应为 1 至 100 个字符"
             return
         }
         val term = query
@@ -178,6 +105,7 @@ internal class CatalogState(private val app: Application) : AndroidViewModel(app
     fun back() {
         when {
             player != null -> player = null
+            managing -> { closeManager(); managing = false }
             environment -> environment = false
             else -> {
                 detailsRequest?.cancel()
@@ -189,9 +117,6 @@ internal class CatalogState(private val app: Application) : AndroidViewModel(app
 
 @Composable
 internal fun CatalogScreen(state: CatalogState) {
-    val picker = rememberLauncherForActivityResult(ActivityResultContracts.OpenDocument()) {
-        if (it != null) state.importDocument(it)
-    }
     val homeScroll = rememberLazyListState()
     val detailScroll = key(state.detail) { rememberLazyListState() }
     val player = state.player
@@ -199,6 +124,7 @@ internal fun CatalogScreen(state: CatalogState) {
     BackHandler(enabled = player == null && (hit != null || state.environment), onBack = state::back)
     when {
         player != null -> PlaybackScreen(title = player.first, url = player.second, onBack = state::back)
+        state.managing -> SourceManagerScreen(state, state::back)
         state.environment -> EnvironmentScreen(onBack = state::back)
         else -> Surface(Modifier.fillMaxSize()) {
             LazyColumn(
@@ -222,20 +148,20 @@ internal fun CatalogScreen(state: CatalogState) {
                     }
                     item {
                         Row(horizontalArrangement = Arrangement.spacedBy(8.dp)) {
-                            Button(onClick = { state.search() }) { Text("搜索") }
-                            TextButton(onClick = { state.search(SAMPLE) }) { Text(SAMPLE) }
+                            Button(onClick = { state.search() }, enabled = !state.busy) { Text("搜索") }
+                            TextButton(onClick = { state.search(SAMPLE) }, enabled = !state.busy) { Text(SAMPLE) }
                         }
                     }
                     item {
                         Row(Modifier.fillMaxWidth(), horizontalArrangement = Arrangement.SpaceBetween) {
-                            TextButton(onClick = { picker.launch(arrayOf("*/*")) }) { Text("导入片源") }
+                            TextButton(onClick = { state.managing = true }) { Text(if (state.sources.isEmpty()) "添加点播源" else "点播源管理") }
                             TextButton(onClick = { state.player = "HLS 对照样片" to CONTROL_HLS_URL }) { Text("播放对照样片") }
                         }
                     }
                     if (state.sources.isNotEmpty()) {
                         item { Text("搜索片源", style = MaterialTheme.typography.titleMedium) }
-                        items(state.sources, key = { "source:${it.url}" }) { source ->
-                            FilterChip(selected = source in state.selected, onClick = { state.toggle(source) }, label = { Text(source.name) })
+                        items(state.managerRows, key = { "source:${it.id}" }) { source ->
+                            FilterChip(selected = source.enabled, enabled = !state.busy, onClick = { state.setEnabled(source.id, !source.enabled) }, label = { Text(source.name) })
                         }
                     }
                     if (state.searching) item { LinearProgressIndicator(Modifier.fillMaxWidth()) }

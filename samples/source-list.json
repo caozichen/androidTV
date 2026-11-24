@@ -1,0 +1,18 @@
+{
+  "name": "脱敏点播预览样本",
+  "sources": [
+    {
+      "name": "示例片库",
+      "url": "https://catalog.example.org/api.php/provide/vod/",
+      "detail": "https://detail.example.org",
+      "isAdult": false
+    },
+    {
+      "name": "同一接口",
+      "url": "https://CATALOG.example.org:443/api.php/provide/vod"
+    }
+  ],
+  "liveSources": [
+    {"name": "示例直播", "url": "https://live.example.org/channels.m3u"}
+  ]
+}
