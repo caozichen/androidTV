@@ -2,6 +2,11 @@ package dev.libretv.android
 
 import android.content.Context
 import android.net.Uri
+import android.net.ConnectivityManager
+import android.net.Network
+import android.os.Handler
+import android.os.Looper
+import android.os.SystemClock
 import android.util.Log
 import androidx.activity.compose.LocalActivity
 import androidx.activity.ComponentActivity
@@ -24,6 +29,7 @@ import androidx.media3.exoplayer.source.LoadEventInfo
 import androidx.media3.exoplayer.source.MediaLoadData
 import java.io.IOException
 import java.util.concurrent.atomic.AtomicLong
+import kotlinx.coroutines.CancellationException
 import kotlinx.coroutines.CoroutineScope
 import kotlinx.coroutines.Job
 import kotlinx.coroutines.delay
@@ -65,10 +71,13 @@ internal fun playbackPhase(error: Boolean, state: Int, wantsPlay: Boolean, suppr
 @androidx.annotation.OptIn(UnstableApi::class)
 internal class PlaybackSession(
     private val context: Context,
-    private val url: String,
+    private var url: String,
     private val scope: CoroutineScope,
     private val savedPosition: MutableLongState,
     private val savedPlayIntent: MutableState<Boolean>,
+    private val refreshUsed: MutableState<Boolean>,
+    private val onCheckpoint: (Long, Long, Boolean) -> Unit,
+    private val refreshUrl: (suspend () -> String?)?,
 ) {
     var player by mutableStateOf<ExoPlayer?>(null)
         private set
@@ -97,15 +106,52 @@ internal class PlaybackSession(
     val positionMs get() = savedPosition.longValue
     val wantsPlay get() = savedPlayIntent.value
     val status get() = phase.label
-    private val uri = Uri.parse(url)
     private val control = url == CONTROL_HLS_URL
-    val valid = control || (uri.scheme == "https" && !uri.host.isNullOrBlank())
+    val valid get() = control || validRemote(url)
+    private fun validRemote(value: String) = Uri.parse(value).let { it.scheme == "https" && !it.host.isNullOrBlank() }
     private var foreground = false
     private var generation = 0L
     private var prepareJob: Job? = null
     private var listener: Player.Listener? = null
     private var analytics: AnalyticsListener? = null
     private var lastProgressBucket = -1L
+    private var lastCheckpointAt = 0L
+    private var lastSnapshot: Triple<Long, Long, Boolean>? = null
+    private var positionAvailable = false
+    private var recoveryJob: Job? = null
+    private var expired = false
+    private var networkFailure = false
+    private var networkChanged = false
+    private var connection: Network? = null
+    private var networkCallback: ConnectivityManager.NetworkCallback? = null
+    private val connectivity get() = context.getSystemService(ConnectivityManager::class.java)
+
+    fun observeNetwork() {
+        if (control) return
+        connection = connectivity.activeNetwork
+        val callback = object : ConnectivityManager.NetworkCallback() {
+            override fun onAvailable(network: Network) {
+                if (networkCallback !== this) return
+                if (network != connection) networkChanged = true
+                connection = network
+                recoverNetworkIfNeeded()
+            }
+            override fun onLost(network: Network) {
+                if (networkCallback === this && connection == network) {
+                    connection = null
+                    networkChanged = true
+                }
+            }
+        }
+        networkCallback = callback
+        connectivity.registerDefaultNetworkCallback(callback, Handler(Looper.getMainLooper()))
+    }
+
+    private fun recoverNetworkIfNeeded() {
+        if (foreground && networkFailure && networkChanged && connection != null) {
+            restart()
+        }
+    }
 
     private fun log(event: String) {
         Log.i(PLAYBACK_TAG, "$event session=$generation")
@@ -134,6 +180,10 @@ internal class PlaybackSession(
         player = current
         generation = sessionIds.incrementAndGet()
         lastProgressBucket = -1L
+        positionAvailable = false
+        networkFailure = false
+        networkChanged = false
+        expired = false
         failure = null
         firstFrame = false
         audioTrack = false
@@ -170,6 +220,7 @@ internal class PlaybackSession(
             override fun onPositionDiscontinuity(old: Player.PositionInfo, new: Player.PositionInfo, reason: Int) {
                 if (!active() || reason != Player.DISCONTINUITY_REASON_SEEK) return
                 savedPosition.longValue = new.positionMs
+                checkpoint(current)
                 log("seek from_ms=" + old.positionMs + " to_ms=" + new.positionMs)
             }
             override fun onPlayerError(error: PlaybackException) {
@@ -185,6 +236,16 @@ internal class PlaybackSession(
                 failure = listOfNotNull(message, http?.let { "HTTP $it" }).joinToString(" · ")
                 update(current)
                 log("player_error code=" + error.errorCodeName + " http=" + http)
+                expired = http == 401 || http == 403 || http == 404 || http == 410
+                networkFailure = error.errorCode == PlaybackException.ERROR_CODE_IO_NETWORK_CONNECTION_FAILED ||
+                    error.errorCode == PlaybackException.ERROR_CODE_IO_NETWORK_CONNECTION_TIMEOUT
+                if (expired && foreground && !refreshUsed.value && refreshUrl != null) {
+                    refreshUsed.value = true
+                    resolveExpired()
+                } else if (networkFailure) {
+                    // Avoid releasing the player from inside its own listener dispatch.
+                    scope.launch { if (active()) recoverNetworkIfNeeded() }
+                }
             }
         }
         val diagnostics = object : AnalyticsListener {
@@ -216,14 +277,16 @@ internal class PlaybackSession(
         prepareJob = scope.launch {
             val mime = resolvePlaybackMimeType(url)
             if (!active()) return@launch
-            current.setMediaItem(MediaItem.Builder().setUri(uri).setMimeType(mime).build(), positionMs)
+            current.setMediaItem(MediaItem.Builder().setUri(Uri.parse(url)).setMimeType(mime).build(), positionMs)
             current.prepare()
         }
     }
 
     private fun update(current: ExoPlayer) {
+        val wasPlaying = playing
         playing = current.isPlaying
-        durationMs = current.duration.coerceAtLeast(0L)
+        if (current.duration > 0) durationMs = current.duration
+        if (current.playbackState == Player.STATE_READY || current.playbackState == Player.STATE_ENDED) positionAvailable = true
         if (!playing) poll()
         canSeek = current.isCurrentMediaItemSeekable && durationMs > 0
         phase = playbackPhase(failure != null, current.playbackState, current.playWhenReady,
@@ -234,11 +297,12 @@ internal class PlaybackSession(
             current.pause()
             log("unsupported_video")
         }
+        if (wasPlaying && !playing || current.playbackState == Player.STATE_ENDED) checkpoint(current)
     }
 
     fun poll() {
         val current = player ?: return
-        if (current.currentMediaItem == null) return
+        if (!positionAvailable || current.currentMediaItem == null || current.playbackState == Player.STATE_IDLE) return
         savedPosition.longValue = if (current.playbackState == Player.STATE_ENDED && current.duration > 0L) {
             current.duration
         } else current.currentPosition.coerceAtLeast(0L)
@@ -247,11 +311,28 @@ internal class PlaybackSession(
             log("progress position_ms=$positionMs")
             lastProgressBucket = bucket
         }
+        if (playing && SystemClock.elapsedRealtime() - lastCheckpointAt >= 5000) checkpoint(current)
+    }
+
+    private fun checkpoint(current: ExoPlayer) {
+        if (!positionAvailable) return
+        val completed = current.playbackState == Player.STATE_ENDED
+        val snapshot = Triple(positionMs, durationMs, completed)
+        if (snapshot == lastSnapshot) return
+        lastSnapshot = snapshot
+        lastCheckpointAt = SystemClock.elapsedRealtime()
+        onCheckpoint(snapshot.first, snapshot.second, snapshot.third)
+    }
+
+    fun flush() {
+        poll()
+        player?.let(::checkpoint)
     }
 
     fun foreground() {
         foreground = true
         player?.playWhenReady = wantsPlay
+        recoverNetworkIfNeeded()
     }
 
     fun background(changingConfiguration: Boolean) {
@@ -259,6 +340,7 @@ internal class PlaybackSession(
         poll()
         if (!changingConfiguration) savedPlayIntent.value = false
         player?.pause()
+        player?.let(::checkpoint)
     }
 
     fun togglePlay() {
@@ -276,14 +358,50 @@ internal class PlaybackSession(
 
     fun retry() {
         if (!valid || failure == null || !foreground) return
-        close()
         savedPlayIntent.value = true
-        start(true)
+        if (expired && refreshUrl != null) resolveExpired() else restart()
+    }
+
+    private fun resolveExpired() {
+        val resolve = refreshUrl ?: return
+        val owner = player ?: return
+        if (recoveryJob?.isActive == true) return
+        recoveryJob = scope.launch {
+            try {
+                val replacement = resolve()
+                if (player !== owner) return@launch
+                if (replacement == null || !validRemote(replacement)) {
+                    failure = "无法确认原剧集，请返回详情重新选集"
+                } else {
+                    url = replacement
+                    restart()
+                }
+            } catch (cancelled: CancellationException) {
+                throw cancelled
+            } catch (e: Exception) {
+                if (player === owner) failure = "播放地址刷新失败，请重试或返回详情"
+            }
+        }
+    }
+
+    private fun restart() {
+        releasePlayer()
+        start(foreground)
     }
 
     fun close() {
+        recoveryJob?.cancel()
+        networkCallback?.let {
+            networkCallback = null
+            connectivity.unregisterNetworkCallback(it)
+        }
+        releasePlayer()
+    }
+
+    private fun releasePlayer() {
         val current = player ?: return
         poll()
+        checkpoint(current)
         // Invalidate the owner before removing listeners or releasing the old player.
         player = null
         prepareJob?.cancel()
@@ -292,22 +410,26 @@ internal class PlaybackSession(
         current.release()
         playing = false
         canSeek = false
-        durationMs = 0
         log("release")
     }
 }
 
 @Composable
-internal fun rememberPlaybackSession(sessionKey: Any, url: String): PlaybackSession {
+internal fun rememberPlaybackSession(sessionKey: Any, url: String, initialPositionMs: Long, initiallyPaused: Boolean,
+    onCheckpoint: (Long, Long, Boolean) -> Unit, refreshUrl: (suspend () -> String?)?): PlaybackSession {
     val context = LocalContext.current.applicationContext
     val activity = LocalActivity.current as ComponentActivity
     val lifecycle = activity.lifecycle
     val scope = rememberCoroutineScope()
-    val position = rememberSaveable(sessionKey, url) { mutableLongStateOf(0L) }
-    val intent = rememberSaveable(sessionKey, url) { mutableStateOf(true) }
-    val session = remember(sessionKey, url, lifecycle) { PlaybackSession(context, url, scope, position, intent) }
+    val position = rememberSaveable(sessionKey, url) { mutableLongStateOf(initialPositionMs.coerceAtLeast(0)) }
+    val intent = rememberSaveable(sessionKey, url) { mutableStateOf(!initiallyPaused) }
+    val refreshUsed = rememberSaveable(sessionKey, url) { mutableStateOf(false) }
+    val session = remember(sessionKey, url, lifecycle) {
+        PlaybackSession(context, url, scope, position, intent, refreshUsed, onCheckpoint, refreshUrl)
+    }
     DisposableEffect(session) {
         session.start(lifecycle.currentState.isAtLeast(Lifecycle.State.STARTED))
+        session.observeNetwork()
         val observer = LifecycleEventObserver { _, event ->
             when (event) {
                 Lifecycle.Event.ON_STOP -> session.background(activity.isChangingConfigurations)

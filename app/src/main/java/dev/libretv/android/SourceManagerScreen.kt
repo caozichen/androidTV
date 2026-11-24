@@ -103,7 +103,7 @@ internal fun SourceManagerScreen(state: CatalogState, onBack: () -> Unit) {
     if (delete != null) AlertDialog(
         onDismissRequest = { deleteId = null },
         title = { Text("删除点播源？") },
-        text = { Text("将从点播源列表移除「${delete.name}」。") },
+        text = { Text("将移除「${delete.name}」。已有历史和进度会保留，重新添加同一端点后可继续观看。") },
         confirmButton = {
             TextButton(onClick = { state.deleteSource(delete.id); deleteId = null }) {
                 Text("确认删除", color = MaterialTheme.colorScheme.error)

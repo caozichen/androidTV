@@ -25,7 +25,7 @@ import org.json.JSONObject
 data class CmsSource(val name: String, val url: String, val id: String = url)
 data class Film(val id: String, val title: String, val year: String, val category: String = "")
 data class Episode(val name: String, val url: String, val explicitLabel: Boolean = true)
-data class PlayLine(val name: String, val episodes: List<Episode>)
+data class PlayLine @JvmOverloads constructor(val name: String, val episodes: List<Episode>, val explicitName: Boolean = true)
 
 internal fun PlayLine.episodeLabels(): List<String> {
     val counts = episodes.groupingBy { it.name }.eachCount()
@@ -192,8 +192,8 @@ internal fun parseCatalogDetail(json: String, id: String): CatalogDetail {
     val lines = film.field("vod_play_url").split("$$$").mapIndexedNotNull { index, group ->
         val episodes = group.split('#').mapIndexedNotNull { position, raw -> parseEpisode(position, raw) }
         if (episodes.isEmpty()) return@mapIndexedNotNull null
-        val name = names.getOrNull(index)?.trim().orEmpty().ifEmpty { "线路 ${index + 1}" }
-        PlayLine(name, episodes)
+        val name = names.getOrNull(index)?.trim().orEmpty()
+        PlayLine(name.ifEmpty { "线路 ${index + 1}" }, episodes, explicitName = name.isNotEmpty())
     }
     return CatalogDetail(Film(film.field("vod_id"), film.field("vod_name"), film.field("vod_year"), film.field("type_name")), lines)
 }

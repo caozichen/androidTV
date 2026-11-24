@@ -2,6 +2,7 @@ package dev.libretv.android
 
 import android.content.Context
 import androidx.room.Dao
+import androidx.room.AutoMigration
 import androidx.room.Database
 import androidx.room.Embedded
 import androidx.room.Entity
@@ -69,9 +70,13 @@ internal interface SourceDao {
     suspend fun delete(id: String)
 }
 
-@Database(entities = [SourceRow::class, CompletedSourceMigration::class], version = 1, exportSchema = true)
+@Database(
+    entities = [SourceRow::class, CompletedSourceMigration::class, WatchRecord::class, WatchPointer::class],
+    version = 2, exportSchema = true, autoMigrations = [AutoMigration(from = 1, to = 2)],
+)
 internal abstract class SourceDatabase : RoomDatabase() {
     abstract fun sources(): SourceDao
+    abstract fun history(): HistoryDao
 
     companion object {
         @Volatile private var instance: SourceDatabase? = null

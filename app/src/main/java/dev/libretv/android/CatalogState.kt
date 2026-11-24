@@ -4,6 +4,8 @@ import android.app.Application
 import android.os.SystemClock
 import androidx.compose.runtime.*
 import androidx.lifecycle.viewModelScope
+import androidx.lifecycle.SavedStateHandle
+import kotlinx.coroutines.flow.first
 import kotlinx.coroutines.CancellationException
 import kotlinx.coroutines.Job
 import kotlinx.coroutines.CoroutineStart
@@ -17,12 +19,22 @@ internal data class PlaybackSelection(
     val url: String,
     val ref: EpisodeRef? = null,
     val index: Int = -1,
+    val watch: HistorySession? = null,
+    val startMs: Long = 0,
+    val initiallyPaused: Boolean = false,
 )
 internal data class FilmHit(val source: CmsSource, val film: Film) {
     val ref get() = VideoRef(source.id, film.id)
 }
 
-internal class CatalogState(app: Application) : SourceManagerState(app) {
+internal class CatalogState(app: Application, private val savedState: SavedStateHandle) : SourceManagerState(app) {
+    private val history = HistoryStore.open(app)
+    var recent by mutableStateOf(emptyList<WatchRecord>())
+        private set
+    private var playRequest: Job? = null
+    private var historyResume: EpisodeRef? = null
+    private var resumePaused = false
+    private var manuallyChosenLine = false
     var managing by mutableStateOf(false)
     var environment by mutableStateOf(false)
     var query by mutableStateOf(SAMPLE)
@@ -69,7 +81,35 @@ internal class CatalogState(app: Application) : SourceManagerState(app) {
     private var selectedEpisode: Episode? = null
     private val ttl = 60_000L
 
-    init { refreshSources() }
+    init {
+        refreshSources()
+        viewModelScope.launch { history.recent.collect { recent = it } }
+        val parts = savedState.get<ArrayList<String>>("playingRef")
+        if (parts?.size == 4) viewModelScope.launch {
+            snapshotFlow { busy }.first { !it }
+            val ref = EpisodeRef(VideoRef(parts[0], parts[1]), parts[2], parts[3])
+            val entry = history.recent.first().find { it.ref.video == ref.video }
+            savedState.remove<ArrayList<String>>("playingRef")
+            if (entry != null && detail == null && !managing && !environment) openHistory(entry, ref, true)
+        }
+    }
+
+    fun deleteHistory(video: VideoRef) { viewModelScope.launch { history.delete(video) } }
+    fun clearHistory() { viewModelScope.launch { history.clear() } }
+
+    fun openHistory(entry: WatchRecord, ref: EpisodeRef = entry.ref, paused: Boolean = false) {
+        val source = managerRows.find { it.id == entry.sourceId }
+        if (source == null || !source.enabled || (filterAdult && (source.isAdult || isAdultCategory(entry.category)))) {
+            notice = when {
+                source == null -> "片源已移除，请在点播源管理重新添加原端点"
+                !source.enabled -> "片源已停用，请在点播源管理启用后继续观看"
+                else -> "当前分类过滤已隐藏此片源或影片"
+            }
+            return
+        }
+        val hit = FilmHit(CmsSource(source.name, source.url, source.id), Film(entry.vodId, entry.title, entry.year, entry.category))
+        open(hit, refresh = true, resume = ref, paused = paused)
+    }
     override fun onSourcesChanged() {
         stopSearch()
         searchedTerm = ""
@@ -138,6 +178,13 @@ internal class CatalogState(app: Application) : SourceManagerState(app) {
 
     fun sourceOptions(): List<FilmHit> = detail?.let { switchCandidates(it, hits) }.orEmpty()
 
+    fun chooseOtherSource() {
+        val hit = detail ?: return
+        if (player != null) back()
+        if (updates.isEmpty()) search(hit.film.title, refresh = true)
+        choosingSource = true
+    }
+
     fun retrySource(id: String) {
         val previous = updates[id] ?: return
         if (!previous.done || previous.error == null || id in retries) return
@@ -178,13 +225,18 @@ internal class CatalogState(app: Application) : SourceManagerState(app) {
         if (failed == 0 && updates.values.all { it.done }) lastSearchTime = SystemClock.elapsedRealtime()
     }
 
-    fun open(hit: FilmHit, switch: Boolean = false, refresh: Boolean = false) {
+    fun open(hit: FilmHit, switch: Boolean = false, refresh: Boolean = false, resume: EpisodeRef? = null, paused: Boolean = false) {
+        playRequest?.cancel()
+        historyResume = resume
+        resumePaused = paused
+        manuallyChosenLine = false
         val old = detail
         val previousEpisode = selectedEpisode
         val previousLines = lines
         val verifiedOrigin = verifiedDetail
         val originCategory = detailCategory
         verifiedDetail = false
+        sameSourceVerified = false
         detailCategory = ""
         detailRequest?.cancel()
         val generation = ++detailGeneration
@@ -211,6 +263,7 @@ internal class CatalogState(app: Application) : SourceManagerState(app) {
                 }
                 lines = fresh.lines
                 verifiedDetail = fresh.confirms(hit.film)
+                sameSourceVerified = fresh.film?.sameHistoryFilm(hit.film) == true
                 detailCategory = fresh.film?.category.orEmpty()
                 val targetComplete = updates[hit.source.id]?.let { it.done && it.error == null && !it.truncated } == true
                 val match = if (switch && old != null && verifiedOrigin && verifiedDetail && targetComplete) {
@@ -226,6 +279,13 @@ internal class CatalogState(app: Application) : SourceManagerState(app) {
                     switch -> "已切换来源，请选择剧集"
                     else -> ""
                 }
+                if (resume != null && lines.isNotEmpty()) {
+                    val location = if (sameSourceVerified) locateEpisode(lines, resume) else null
+                    if (location != null) {
+                        lineIndex = location.lineIndex
+                        play(location.episodeIndex, paused)
+                    } else detailStatus = "上次剧集无法唯一确认，请重新选集"
+                }
             } catch (e: CancellationException) {
                 throw e
             } catch (e: Exception) {
@@ -236,8 +296,48 @@ internal class CatalogState(app: Application) : SourceManagerState(app) {
         }
     }
 
+    fun reloadDetail(hit: FilmHit) = open(hit, refresh = true, resume = historyResume, paused = resumePaused)
+
+    private var sameSourceVerified = false
+
+    fun detailHistory(): WatchRecord? {
+        val hit = detail ?: return null
+        if (manuallyChosenLine) return null
+        return recent.firstOrNull { it.ref.video == hit.ref && hit.film.sameHistoryFilm(Film(it.vodId, it.title, it.year)) }
+    }
+
+    fun nextAfterCompletion(): EpisodeMatch? {
+        val previous = detailHistory()?.takeIf { it.completed } ?: return null
+        if (!sameSourceVerified || (lastEpisode != null && lastEpisode != previous.ref)) return null
+        val current = locateEpisode(lines, previous.ref) ?: return null
+        val nextIndex = current.episodeIndex + 1
+        return if (nextIndex in lines[current.lineIndex].episodes.indices) EpisodeMatch(current.lineIndex, nextIndex) else null
+    }
+
+    fun playNextAfterCompletion() {
+        val next = nextAfterCompletion() ?: return
+        lineIndex = next.lineIndex
+        play(next.episodeIndex)
+    }
+
+    fun primaryPlay() {
+        val preferred = lastEpisode
+        val previous = detailHistory()
+        val ref = preferred ?: previous?.ref
+        if (ref == null) { play(0); return }
+        val loc = if (sameSourceVerified) locateEpisode(lines, ref) else null
+        if (loc == null) {
+            detailStatus = "上次剧集无法唯一确认，请重新选集"
+            return
+        }
+        lineIndex = loc.lineIndex
+        play(loc.episodeIndex)
+    }
+
     fun selectLine(index: Int) {
         if (index == lineIndex) return
+        playRequest?.cancel()
+        manuallyChosenLine = true
         lineIndex = index
         selectedEpisode = null
         lastEpisode = null
@@ -248,7 +348,11 @@ internal class CatalogState(app: Application) : SourceManagerState(app) {
         val video = detail?.ref ?: return null
         val line = lines.getOrNull(lineIndex) ?: return null
         val ep = line.episodes.getOrNull(index) ?: return null
-        val lineKey = if (lines.count { it.name == line.name } == 1) "name:${line.name}" else "index:$lineIndex"
+        val lineKey = when {
+            line.explicitName && lines.count { it.name == line.name } == 1 -> "name:${line.name}"
+            !line.explicitName && lines.size == 1 -> "single"
+            else -> "index:$lineIndex"
+        }
         val epKey = if (ep.explicitLabel && line.episodes.count { it.name == ep.name } == 1) "name:${ep.name}" else "index:$index"
         return EpisodeRef(video, lineKey, epKey)
     }
@@ -258,12 +362,55 @@ internal class CatalogState(app: Application) : SourceManagerState(app) {
         selectedEpisode = lines[lineIndex].episodes[index]
     }
 
-    fun play(index: Int) {
-        val film = detail?.film ?: return
+    fun play(index: Int, paused: Boolean = false) {
+        val hit = detail ?: return
+        val film = hit.film
         val ref = episodeRef(index) ?: return
         rememberEpisode(index)
         val episode = selectedEpisode ?: return
-        player = PlaybackSelection("${film.title} · ${lines[lineIndex].episodeLabels()[index]}", episode.url, ref, index)
+        val line = lines[lineIndex]
+        val label = line.episodeLabels()[index]
+        val meta = WatchRecord(ref.video.sourceId, ref.video.vodId, ref.lineId, ref.episodeId,
+            hit.source.name, film.title, film.year, film.category, line.name, label)
+        playRequest?.cancel()
+        playRequest = viewModelScope.launch {
+            val previous = if (sameSourceVerified && locateEpisode(lines, ref) != null) history.progress(ref) else null
+            val start = previous?.takeIf { !it.completed && film.sameHistoryFilm(Film(it.vodId, it.title, it.year)) }?.positionMs ?: 0L
+            player = PlaybackSelection("${film.title} · $label", episode.url, ref, index, history.begin(meta), start, paused)
+            savedState["playingRef"] = arrayListOf(ref.video.sourceId, ref.video.vodId, ref.lineId, ref.episodeId)
+        }
+    }
+
+    fun checkpoint(selection: PlaybackSelection, positionMs: Long, durationMs: Long, completed: Boolean) {
+        selection.watch?.let { history.save(it, positionMs, durationMs, completed) }
+    }
+
+    suspend fun refreshEpisodeUrl(selection: PlaybackSelection): String? {
+        val ref = selection.ref ?: return null
+        val hit = detail ?: return null
+        if (selection.watch != player?.watch || ref.video != hit.ref) return null
+        val fresh = detailsCache.load(hit.ref, true) { loadCatalogDetail(hit.source, ref.video.vodId) }
+        if (selection.watch != player?.watch || detail?.ref != ref.video) return null
+        val safeFilm = fresh.film?.sameHistoryFilm(hit.film) == true && !(filterAdult && isAdultCategory(fresh.film.category))
+        val match = if (safeFilm) locateEpisode(fresh.lines, ref) else null
+        if (match == null) {
+            back()
+            lines = if (safeFilm) fresh.lines else emptyList()
+            lineIndex = 0
+            lastEpisode = null
+            selectedEpisode = null
+            historyResume = null
+            verifiedDetail = safeFilm && fresh.confirms(hit.film)
+            sameSourceVerified = safeFilm
+            detailCategory = fresh.film?.category.orEmpty()
+            detailStatus = if (safeFilm) "来源的剧集已变化，请重新选集" else "来源的影片信息已变化，请返回搜索重新确认"
+            return null
+        }
+        lines = fresh.lines
+        lineIndex = match.lineIndex
+        rememberEpisode(match.episodeIndex)
+        player = selection.copy(index = match.episodeIndex)
+        return lines[lineIndex].episodes[match.episodeIndex].url
     }
 
     fun playControl() {
@@ -271,6 +418,8 @@ internal class CatalogState(app: Application) : SourceManagerState(app) {
     }
 
     fun back() {
+        playRequest?.cancel()
+        savedState.remove<ArrayList<String>>("playingRef")
         when {
             player != null -> player = null
             choosingSource -> choosingSource = false

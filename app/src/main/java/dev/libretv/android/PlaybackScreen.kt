@@ -48,6 +48,11 @@ internal fun PlaybackScreen(
     episodeIndex: Int,
     onEpisode: (Int) -> Unit,
     onBack: () -> Unit,
+    initialPositionMs: Long = 0L,
+    initiallyPaused: Boolean = false,
+    onCheckpoint: (Long, Long, Boolean) -> Unit = { _, _, _ -> },
+    refreshUrl: (suspend () -> String?)? = null,
+    onSwitchSource: (() -> Unit)? = null,
 ) {
     val activity = checkNotNull(LocalActivity.current)
     val landscape = LocalConfiguration.current.orientation == Configuration.ORIENTATION_LANDSCAPE
@@ -55,7 +60,11 @@ internal fun PlaybackScreen(
     var fullScreen by rememberSaveable { mutableStateOf(landscape) }
     var lastLandscape by rememberSaveable { mutableStateOf(landscape) }
     var choosingEpisode by rememberSaveable { mutableStateOf(false) }
-    val session = rememberPlaybackSession(sessionKey, url)
+    val session = rememberPlaybackSession(sessionKey, url, initialPositionMs, initiallyPaused, onCheckpoint, refreshUrl)
+    val switchEpisode: (Int) -> Unit = { index ->
+        session.flush()
+        onEpisode(index)
+    }
     var controlsVisible by remember(session) { mutableStateOf(true) }
     var scrubbing by remember(session) { mutableStateOf(false) }
     val accessibility = LocalAccessibilityManager.current
@@ -114,12 +123,15 @@ internal fun PlaybackScreen(
         controlsVisible = true
         activity.requestedOrientation = if (enter) ActivityInfo.SCREEN_ORIENTATION_SENSOR_LANDSCAPE else originalOrientation
     }
-    val back = { if (fullScreen) setFullScreen(false) else onBack() }
+    val back = { if (fullScreen) setFullScreen(false) else { session.flush(); onBack() } }
     BackHandler(onBack = back)
 
     val controls: @Composable () -> Unit = {
-        PlaybackControls(session, episodeNames.size, episodeIndex, onEpisode,
+        PlaybackControls(session, episodeNames.size, episodeIndex, switchEpisode,
             onChoose = { choosingEpisode = true }, onScrub = { scrubbing = it })
+        if (session.failure != null && onSwitchSource != null) {
+            TextButton(onClick = { session.flush(); onSwitchSource() }) { Text("换源") }
+        }
     }
     if (fullScreen) {
         Box(Modifier.fillMaxSize().background(Color.Black)) {
@@ -185,7 +197,7 @@ internal fun PlaybackScreen(
                         TextButton(
                             modifier = Modifier.fillMaxWidth(), onClick = {
                                 choosingEpisode = false
-                                if (!current) onEpisode(index)
+                                if (!current) switchEpisode(index)
                             },
                         ) {
                             Text(episodeNames[index] + if (current) " · 当前" else "", Modifier.weight(1f))

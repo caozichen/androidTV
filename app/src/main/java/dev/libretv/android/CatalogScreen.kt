@@ -27,7 +27,12 @@ internal fun CatalogScreen(state: CatalogState) {
             PlaybackScreen(
                 title = player.title,
                 url = player.url,
-                sessionKey = player.ref ?: CONTROL_HLS_URL,
+                sessionKey = player.watch ?: CONTROL_HLS_URL,
+                initialPositionMs = player.startMs,
+                initiallyPaused = player.initiallyPaused,
+                onCheckpoint = { position, duration, complete -> state.checkpoint(player, position, duration, complete) },
+                refreshUrl = if (player.ref == null) null else suspend { state.refreshEpisodeUrl(player) },
+                onSwitchSource = if (player.ref == null) null else state::chooseOtherSource,
                 episodeNames = labels,
                 episodeIndex = player.index,
                 onEpisode = { index -> if (state.player == player && index in labels.indices) state.play(index) },
@@ -90,6 +95,7 @@ internal fun CatalogScreen(state: CatalogState) {
                         Text("搜索中 · 已完成 ${state.updates.values.count { it.done }} / ${state.updates.size} 个片源")
                     }
                     if (state.notice.isNotBlank()) item { Text(state.notice) }
+                    if (state.recent.isNotEmpty()) item { RecentWatches(state) }
                     if (state.updates.isNotEmpty()) item {
                         Row {
                             TextButton(onClick = { showProgress = !showProgress }) { Text("各源状态") }
@@ -123,12 +129,25 @@ internal fun CatalogScreen(state: CatalogState) {
                             FilmButton(option, state.sourceLabel(option) + " · 条目 " + option.film.id) { state.open(option, switch = true) }
                         }
                     } else {
-                        item { TextButton(onClick = { state.choosingSource = true }) { Text("换源") } }
+                        item { TextButton(onClick = state::chooseOtherSource) { Text("换源") } }
                         if (state.detailStatus.isNotBlank()) item { Text(state.detailStatus) }
                         if (!state.loadingDetail && state.lines.isEmpty()) item {
-                            TextButton(onClick = { state.open(hit, refresh = true) }) { Text("重新加载") }
+                            TextButton(onClick = { state.reloadDetail(hit) }) { Text("重新加载") }
                         }
                         if (state.lines.isNotEmpty()) {
+                            item {
+                                val previous = state.detailHistory()
+                                val text = when {
+                                    state.lastEpisode != null && state.lastEpisode != previous?.ref -> "播放已选剧集"
+                                    previous == null -> "播放第一集"
+                                    previous.completed -> "重播 ${previous.episodeName}"
+                                    else -> "继续 ${previous.episodeName}"
+                                }
+                                Button(onClick = state::primaryPlay) { Text(text) }
+                                if (state.nextAfterCompletion() != null) {
+                                    TextButton(onClick = state::playNextAfterCompletion) { Text("播放下一集") }
+                                }
+                            }
                             item { Text("播放线路", style = MaterialTheme.typography.titleMedium) }
                             items(state.lines.size) { index ->
                                 FilterChip(selected = state.lineIndex == index, onClick = { state.selectLine(index) }, label = { Text(state.lines[index].name) })
