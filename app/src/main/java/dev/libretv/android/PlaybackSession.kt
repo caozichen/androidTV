@@ -38,13 +38,25 @@ internal enum class PlaybackPhase(val label: String) {
     INTERRUPTED("音频焦点中断"), ENDED("已播完"), FAILED("播放失败")
 }
 
+internal enum class PlaybackTracks { PENDING, AUDIO_ONLY, VIDEO_SELECTED, VIDEO_UNSUPPORTED }
+
+internal fun classifyPlaybackTracks(
+    hasVideo: Boolean, videoSelected: Boolean, videoSupported: Boolean, audioSelected: Boolean,
+): PlaybackTracks = when {
+    videoSelected -> PlaybackTracks.VIDEO_SELECTED
+    hasVideo && !videoSupported -> PlaybackTracks.VIDEO_UNSUPPORTED
+    !hasVideo && audioSelected -> PlaybackTracks.AUDIO_ONLY
+    else -> PlaybackTracks.PENDING
+}
+
 internal fun playbackPhase(error: Boolean, state: Int, wantsPlay: Boolean, suppressed: Boolean,
-                           firstFrame: Boolean, audioOnly: Boolean): PlaybackPhase = when {
+                           firstFrame: Boolean, tracks: PlaybackTracks): PlaybackPhase = when {
     error -> PlaybackPhase.FAILED
+    tracks == PlaybackTracks.VIDEO_UNSUPPORTED && (state == Player.STATE_READY || state == Player.STATE_ENDED) -> PlaybackPhase.FAILED
     state == Player.STATE_ENDED -> PlaybackPhase.ENDED
     !wantsPlay -> PlaybackPhase.PAUSED
     suppressed -> PlaybackPhase.INTERRUPTED
-    !firstFrame && !audioOnly -> PlaybackPhase.WAITING
+    tracks != PlaybackTracks.AUDIO_ONLY && !(tracks == PlaybackTracks.VIDEO_SELECTED && firstFrame) -> PlaybackPhase.WAITING
     state == Player.STATE_BUFFERING -> PlaybackPhase.BUFFERING
     state == Player.STATE_READY -> PlaybackPhase.PLAYING
     else -> PlaybackPhase.WAITING
@@ -74,6 +86,8 @@ internal class PlaybackSession(
         private set
     var audioAdvanced by mutableStateOf(false)
         private set
+    private var tracks by mutableStateOf(PlaybackTracks.PENDING)
+    val audioOnly get() = tracks == PlaybackTracks.AUDIO_ONLY
     var playing by mutableStateOf(false)
         private set
     var durationMs by mutableLongStateOf(0L)
@@ -124,6 +138,7 @@ internal class PlaybackSession(
         firstFrame = false
         audioTrack = false
         audioAdvanced = false
+        tracks = PlaybackTracks.PENDING
         manifests = 0
         mediaLoads = 0
         fun active() = player === current
@@ -143,6 +158,13 @@ internal class PlaybackSession(
             override fun onTracksChanged(tracks: Tracks) {
                 if (!active()) return
                 audioTrack = tracks.isTypeSelected(C.TRACK_TYPE_AUDIO)
+                this@PlaybackSession.tracks = classifyPlaybackTracks(
+                    tracks.containsType(C.TRACK_TYPE_VIDEO),
+                    tracks.isTypeSelected(C.TRACK_TYPE_VIDEO),
+                    tracks.isTypeSupported(C.TRACK_TYPE_VIDEO, true),
+                    audioTrack,
+                )
+                if (this@PlaybackSession.tracks != PlaybackTracks.VIDEO_SELECTED) firstFrame = false
                 log("tracks audio_selected=$audioTrack")
             }
             override fun onPositionDiscontinuity(old: Player.PositionInfo, new: Player.PositionInfo, reason: Int) {
@@ -202,19 +224,24 @@ internal class PlaybackSession(
     private fun update(current: ExoPlayer) {
         playing = current.isPlaying
         durationMs = current.duration.coerceAtLeast(0L)
-        if (current.playbackState == Player.STATE_ENDED && durationMs > 0) {
-            savedPosition.longValue = durationMs
-        }
+        if (!playing) poll()
         canSeek = current.isCurrentMediaItemSeekable && durationMs > 0
         phase = playbackPhase(failure != null, current.playbackState, current.playWhenReady,
             current.playbackSuppressionReason != Player.PLAYBACK_SUPPRESSION_REASON_NONE,
-            firstFrame, audioTrack && !current.currentTracks.isTypeSelected(C.TRACK_TYPE_VIDEO))
+            firstFrame, tracks)
+        if (phase == PlaybackPhase.FAILED && failure == null) {
+            failure = "此设备不支持视频轨，请返回详情切换线路或来源"
+            current.pause()
+            log("unsupported_video")
+        }
     }
 
     fun poll() {
         val current = player ?: return
         if (current.currentMediaItem == null) return
-        savedPosition.longValue = current.currentPosition.coerceAtLeast(0L)
+        savedPosition.longValue = if (current.playbackState == Player.STATE_ENDED && current.duration > 0L) {
+            current.duration
+        } else current.currentPosition.coerceAtLeast(0L)
         val bucket = positionMs / 5000
         if (playing && bucket != lastProgressBucket) {
             log("progress position_ms=$positionMs")

@@ -36,6 +36,8 @@ import androidx.media3.ui.R as MediaR
 import kotlinx.coroutines.delay
 import java.util.Locale
 
+private val fullScreenColors = darkColorScheme(primary = Color.White, onPrimary = Color.Black)
+
 @androidx.annotation.OptIn(UnstableApi::class)
 @Composable
 internal fun PlaybackScreen(
@@ -104,6 +106,9 @@ internal fun PlaybackScreen(
             controlsVisible = false
         }
     }
+    LaunchedEffect(session, session.phase) {
+        if (session.phase != PlaybackPhase.PLAYING) controlsVisible = true
+    }
     val setFullScreen: (Boolean) -> Unit = { enter ->
         fullScreen = enter
         controlsVisible = true
@@ -119,50 +124,51 @@ internal fun PlaybackScreen(
     if (fullScreen) {
         Box(Modifier.fillMaxSize().background(Color.Black)) {
             PlaybackVideo(session, Modifier.fillMaxSize())
-            Box(Modifier.matchParentSize().clickable(
-                onClickLabel = if (controlsVisible) "隐藏播放控件" else "显示播放控件",
-                onClick = { controlsVisible = !controlsVisible },
-            ).semantics { contentDescription = "播放画面" })
-            if (controlsVisible || !session.playing) {
+            val failed = session.failure != null
+            if (!failed) {
+                Box(Modifier.matchParentSize().clickable(
+                    onClickLabel = if (controlsVisible) "隐藏播放控件" else "显示播放控件",
+                    onClick = { controlsVisible = !controlsVisible },
+                ).semantics { contentDescription = "播放画面" })
+            }
+            if (controlsVisible || failed) {
                 Column(
                     Modifier.align(Alignment.BottomCenter).fillMaxWidth()
                         .background(Color.Black.copy(alpha = 0.82f))
                         .windowInsetsPadding(WindowInsets.safeDrawing)
                         .padding(horizontal = 12.dp),
                 ) {
-                    CompositionLocalProvider(LocalContentColor provides Color.White) {
-                        Row(verticalAlignment = Alignment.CenterVertically) {
-                            Text(title, Modifier.weight(1f), maxLines = 1, overflow = TextOverflow.Ellipsis)
-                            PlayerIcon("退出全屏", MediaR.drawable.exo_ic_fullscreen_exit) { setFullScreen(false) }
+                    MaterialTheme(colorScheme = fullScreenColors) {
+                        CompositionLocalProvider(LocalContentColor provides Color.White) {
+                            Row(verticalAlignment = Alignment.CenterVertically) {
+                                Text(title, Modifier.weight(1f), maxLines = 1, overflow = TextOverflow.Ellipsis)
+                                PlayerIcon("退出全屏", MediaR.drawable.exo_ic_fullscreen_exit) { setFullScreen(false) }
+                            }
+                            Text(session.failure ?: session.status, maxLines = 2, overflow = TextOverflow.Ellipsis)
+                            controls()
                         }
-                        Text(session.failure ?: session.status, maxLines = 2, overflow = TextOverflow.Ellipsis)
-                        controls()
                     }
                 }
             }
         }
     } else {
         Surface(Modifier.fillMaxSize()) {
-            Column(Modifier.windowInsetsPadding(WindowInsets.safeDrawing).verticalScroll(rememberScrollState())) {
+            val content = Modifier.fillMaxSize().windowInsetsPadding(WindowInsets.safeDrawing)
+            Column(if (landscape) content else content.verticalScroll(rememberScrollState())) {
                 Row(Modifier.fillMaxWidth().padding(horizontal = 8.dp), verticalAlignment = Alignment.CenterVertically) {
                     TextButton(onClick = back) { Text("返回") }
-                    Text(title, Modifier.weight(1f), style = MaterialTheme.typography.titleMedium)
+                    Text(title, Modifier.weight(1f), style = MaterialTheme.typography.titleMedium,
+                        maxLines = if (landscape) 2 else Int.MAX_VALUE, overflow = TextOverflow.Ellipsis)
                     PlayerIcon("全屏", MediaR.drawable.exo_ic_fullscreen_enter) { setFullScreen(true) }
                 }
-                PlaybackVideo(session, Modifier.fillMaxWidth().aspectRatio(16f / 9f))
-                Column(Modifier.padding(horizontal = 16.dp, vertical = 8.dp)) {
-                    Text(session.failure ?: session.status, style = MaterialTheme.typography.titleMedium)
-                    controls()
-                    HorizontalDivider(Modifier.padding(vertical = 8.dp))
-                    val audio = when {
-                        session.audioAdvanced -> "已输出"
-                        session.audioTrack -> "已选择"
-                        else -> "等待"
+                if (landscape) {
+                    Row(Modifier.fillMaxSize()) {
+                        PlaybackVideo(session, Modifier.weight(0.55f).fillMaxHeight())
+                        WindowedControls(session, Modifier.weight(0.45f).verticalScroll(rememberScrollState()), controls)
                     }
-                    Text("首帧 " + (if (session.firstFrame) "已显示" else "等待") + "  ·  音轨 " + audio,
-                        style = MaterialTheme.typography.bodySmall)
-                    Text("清单 " + session.manifests + "  ·  媒体加载 " + session.mediaLoads,
-                        style = MaterialTheme.typography.bodySmall)
+                } else {
+                    PlaybackVideo(session, Modifier.fillMaxWidth().aspectRatio(16f / 9f))
+                    WindowedControls(session, Modifier.fillMaxWidth(), controls)
                 }
             }
         }
@@ -189,6 +195,25 @@ internal fun PlaybackScreen(
             },
             confirmButton = { TextButton(onClick = { choosingEpisode = false }) { Text("关闭") } },
         )
+    }
+}
+
+@Composable
+private fun WindowedControls(session: PlaybackSession, modifier: Modifier, controls: @Composable () -> Unit) {
+    Column(modifier.padding(horizontal = 16.dp, vertical = 8.dp)) {
+        Text(session.failure ?: session.status, style = MaterialTheme.typography.titleMedium)
+        controls()
+        HorizontalDivider(Modifier.padding(vertical = 8.dp))
+        val audio = when {
+            session.audioAdvanced -> "已输出"
+            session.audioTrack -> "已选择"
+            else -> "等待"
+        }
+        val picture = if (session.audioOnly) "纯音频" else "首帧 " + (if (session.firstFrame) "已显示" else "等待")
+        Text("$picture  ·  音轨 $audio",
+            style = MaterialTheme.typography.bodySmall)
+        Text("清单 " + session.manifests + "  ·  媒体加载 " + session.mediaLoads,
+            style = MaterialTheme.typography.bodySmall)
     }
 }
 

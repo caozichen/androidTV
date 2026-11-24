@@ -29,9 +29,12 @@ data class PlayLine(val name: String, val episodes: List<Episode>)
 
 internal fun PlayLine.episodeLabels(): List<String> {
     val counts = episodes.groupingBy { it.name }.eachCount()
-    return episodes.mapIndexed { index, episode ->
+    val labels = episodes.mapIndexed { index, episode ->
         if (counts[episode.name] == 1) episode.name else "${episode.name}（第 ${index + 1} 项）"
     }
+    if (labels.toSet().size == labels.size) return labels
+    // An original title can already contain the suffix used to distinguish duplicates.
+    return episodes.mapIndexed { index, episode -> "${index + 1} · ${episode.name}" }
 }
 
 private const val MAX_BYTES = 4L * 1024 * 1024
