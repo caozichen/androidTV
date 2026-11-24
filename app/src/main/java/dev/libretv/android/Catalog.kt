@@ -6,6 +6,8 @@ import java.net.UnknownHostException
 import java.util.concurrent.TimeUnit
 import kotlin.coroutines.resume
 import kotlin.coroutines.resumeWithException
+import kotlin.coroutines.AbstractCoroutineContextElement
+import kotlin.coroutines.CoroutineContext
 import kotlinx.coroutines.Dispatchers
 import kotlinx.coroutines.suspendCancellableCoroutine
 import kotlinx.coroutines.withContext
@@ -44,8 +46,19 @@ internal fun catalogErrorText(error: Exception): String = when (error) {
     else -> "请求失败，请重试或换源"
 }
 
+// A search source can expire while OkHttp still holds its call in the global dispatcher queue.
+internal class SearchDispatchState : AbstractCoroutineContextElement(Key) {
+    companion object Key : CoroutineContext.Key<SearchDispatchState>
+    @Volatile var started = false
+    @Volatile var expiredInQueue = false
+}
+
 internal val catalogClient = OkHttpClient.Builder()
     .dispatcher(okhttp3.Dispatcher().apply { maxRequests = 4; maxRequestsPerHost = 4 })
+    .addInterceptor { chain ->
+        chain.request().tag(SearchDispatchState::class.java)?.started = true
+        chain.proceed(chain.request())
+    }
     .connectTimeout(8, TimeUnit.SECONDS)
     .readTimeout(10, TimeUnit.SECONDS)
     .callTimeout(12, TimeUnit.SECONDS)
@@ -71,7 +84,7 @@ internal suspend fun fetchSearchPage(source: CmsSource, keyword: String, page: I
 internal data class CatalogDetail(val film: Film?, val lines: List<PlayLine>) {
     fun confirms(expected: Film): Boolean = film != null && film.id == expected.id &&
         film.year.isNotBlank() && film.year == expected.year && film.title.isNotBlank() &&
-        normalizeCatalogTitle(film.title) == normalizeCatalogTitle(expected.title)
+        sameFilmTitle(film.title, expected.title)
 }
 
 internal suspend fun loadCatalogDetail(source: CmsSource, id: String): CatalogDetail {
@@ -95,9 +108,15 @@ internal fun catalogUrl(source: CmsSource, parameters: Map<String, String>): Htt
 }
 
 internal suspend fun fetchCatalog(url: HttpUrl, client: OkHttpClient = catalogClient): String = suspendCancellableCoroutine { continuation ->
-    val request = Request.Builder().url(url).header("Accept", "application/json").build()
+    val dispatch = continuation.context[SearchDispatchState]
+    dispatch?.started = false
+    val request = Request.Builder().url(url).header("Accept", "application/json")
+        .tag(SearchDispatchState::class.java, dispatch).build()
     val call = client.newCall(request)
-    continuation.invokeOnCancellation { call.cancel() }
+    continuation.invokeOnCancellation {
+        if (dispatch != null) dispatch.expiredInQueue = !dispatch.started
+        call.cancel()
+    }
     call.enqueue(object : Callback {
         override fun onFailure(call: Call, e: IOException) {
             continuation.resumeWithException(e)
@@ -148,7 +167,8 @@ internal fun parseCatalogPage(json: String): CatalogPage {
             films[id] = Film(id, title, row.field("vod_year"), row.field("type_name"))
         }
     }
-    return CatalogPage(films.values.toList(), root.optInt("pagecount", 1).coerceIn(1, 5))
+    val reported = root.field("pagecount").toLongOrNull() ?: 1L
+    return CatalogPage(films.values.toList(), reported.coerceIn(1L, Int.MAX_VALUE.toLong()).toInt())
 }
 
 internal fun parseLines(json: String, id: String): List<PlayLine> = parseCatalogDetail(json, id).lines

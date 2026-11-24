@@ -6,6 +6,7 @@ import androidx.compose.runtime.*
 import androidx.lifecycle.viewModelScope
 import kotlinx.coroutines.CancellationException
 import kotlinx.coroutines.Job
+import kotlinx.coroutines.CoroutineStart
 import kotlinx.coroutines.launch
 
 internal const val SAMPLE = "航拍中国"
@@ -50,11 +51,14 @@ internal class CatalogState(app: Application) : SourceManagerState(app) {
     var choosingSource by mutableStateOf(false)
     var player by mutableStateOf<Pair<String, String>?>(null)
     private var request: Job? = null
+    private val retries = mutableMapOf<String, Job>()
+    private var fullSearchRunning = false
     private var detailRequest: Job? = null
     private var detailGeneration = 0L
     private var lastSearchTime = 0L
-    private val detailsCache = linkedMapOf<VideoRef, Pair<Long, CatalogDetail>>()
+    private val detailsCache = DetailCache(SystemClock::elapsedRealtime)
     private var verifiedDetail = false
+    private var detailCategory = ""
     private var selectedEpisode: Episode? = null
     private val ttl = 60_000L
 
@@ -71,6 +75,9 @@ internal class CatalogState(app: Application) : SourceManagerState(app) {
     fun stopSearch() {
         searchNumber++
         request?.cancel()
+        retries.values.toList().forEach { it.cancel() }
+        retries.clear()
+        fullSearchRunning = false
         if (searching) notice = "已取消搜索"
         searching = false
     }
@@ -110,34 +117,68 @@ internal class CatalogState(app: Application) : SourceManagerState(app) {
         for (source in targets) updates[source.id] = SourceSearchUpdate(source, emptyList(), 0, false)
         notice = ""
         searching = true
+        fullSearchRunning = true
         request = viewModelScope.launch {
             runCatalogSearch(targets, term, filterAdult) { update ->
                 if (generation == searchNumber) updates[update.source.id] = update
             }
             if (generation == searchNumber) {
-                searching = false
-                val failed = updates.values.count { it.error != null }
-                val hasPage = updates.values.any { it.pages > 0 }
-                notice = when {
-                    !hasPage && updates.values.all { it.error?.contains("超时") == true } -> "全部片源请求超时"
-                    !hasPage -> "全部片源请求失败"
-                    failed > 0 -> "部分请求失败，已保留成功结果"
-                    hits.isEmpty() -> "未找到匹配影片"
-                    else -> "搜索完成 · ${hits.size} 个结果"
-                }
-                if (failed == 0) lastSearchTime = SystemClock.elapsedRealtime()
+                fullSearchRunning = false
+                finishSearch()
             }
         }
     }
 
     fun sourceOptions(): List<FilmHit> = detail?.let { switchCandidates(it, hits) }.orEmpty()
 
+    fun retrySource(id: String) {
+        val previous = updates[id] ?: return
+        if (!previous.done || previous.error == null || id in retries) return
+        val generation = searchNumber
+        val term = searchedTerm
+        val filter = filterAdult
+        val job = viewModelScope.launch(start = CoroutineStart.LAZY) {
+            try {
+                retryCatalogSource(previous, term, filter, ::runCatalogSearch) { update ->
+                    if (generation == searchNumber) updates[id] = update
+                }
+            } finally {
+                if (generation == searchNumber) {
+                    retries.remove(id)
+                    finishSearch()
+                }
+            }
+        }
+        retries[id] = job
+        searching = true
+        notice = ""
+        job.start()
+    }
+
+    private fun finishSearch() {
+        searching = fullSearchRunning || retries.isNotEmpty()
+        if (searching) return
+        val failed = updates.values.count { it.error != null }
+        val hasPage = updates.values.any { it.pages > 0 }
+        notice = when {
+            updates.values.any { !it.done } -> "已取消搜索"
+            !hasPage && updates.values.all { it.error?.contains("超时") == true } -> "全部片源请求超时"
+            !hasPage -> "全部片源请求失败"
+            failed > 0 -> "部分请求失败，已保留成功结果"
+            hits.isEmpty() -> "未找到匹配影片"
+            else -> "搜索完成 · ${hits.size} 个结果"
+        }
+        if (failed == 0 && updates.values.all { it.done }) lastSearchTime = SystemClock.elapsedRealtime()
+    }
+
     fun open(hit: FilmHit, switch: Boolean = false, refresh: Boolean = false) {
         val old = detail
         val previousEpisode = selectedEpisode
         val previousLines = lines
         val verifiedOrigin = verifiedDetail
+        val originCategory = detailCategory
         verifiedDetail = false
+        detailCategory = ""
         detailRequest?.cancel()
         val generation = ++detailGeneration
         detail = hit
@@ -150,27 +191,23 @@ internal class CatalogState(app: Application) : SourceManagerState(app) {
         detailStatus = "正在加载剧集…"
         detailRequest = viewModelScope.launch {
             try {
-                val cached = detailsCache[hit.ref]
-                val fresh = if (!switch && !refresh && cached != null && SystemClock.elapsedRealtime() - cached.first < ttl) {
-                    cached.second
-                } else loadCatalogDetail(hit.source, hit.film.id)
+                val fresh = detailsCache.load(hit.ref, switch || refresh) { loadCatalogDetail(hit.source, hit.film.id) }
                 if (generation != detailGeneration) return@launch
-                detailsCache[hit.ref] = SystemClock.elapsedRealtime() to fresh
-                if (detailsCache.size > 12) detailsCache.remove(detailsCache.keys.first())
                 if (filterAdult && isAdultCategory(fresh.film?.category.orEmpty())) {
                     detailStatus = "此影片已被当前分类过滤"
                     return@launch
                 }
-                if (fresh.film?.title?.takeIf { it.isNotBlank() }?.let { normalizeCatalogTitle(it) != normalizeCatalogTitle(hit.film.title) } == true ||
+                if (fresh.film?.title?.takeIf { it.isNotBlank() }?.let { !sameFilmTitle(it, hit.film.title) } == true ||
                     (fresh.film?.year?.isNotBlank() == true && hit.film.year.isNotBlank() && fresh.film.year != hit.film.year)) {
                     detailStatus = "来源返回的影片信息已变化，请返回搜索重新确认"
                     return@launch
                 }
                 lines = fresh.lines
                 verifiedDetail = fresh.confirms(hit.film)
-                val targetComplete = updates[hit.source.id]?.let { it.done && it.error == null } == true
+                detailCategory = fresh.film?.category.orEmpty()
+                val targetComplete = updates[hit.source.id]?.let { it.done && it.error == null && !it.truncated } == true
                 val match = if (switch && old != null && verifiedOrigin && verifiedDetail && targetComplete) {
-                    suggestSwitchEpisode(old, previousEpisode, previousLines, hit, lines, hits)
+                    suggestSwitchEpisode(old, previousEpisode, previousLines, hit, lines, hits, originCategory, detailCategory)
                 } else null
                 detailStatus = when {
                     lines.isEmpty() -> "此来源暂无可播放的 HTTPS 剧集"

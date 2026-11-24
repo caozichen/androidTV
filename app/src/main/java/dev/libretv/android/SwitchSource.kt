@@ -12,14 +12,26 @@ private val cnEpisode = Regex("""第\s*($NUMBER)\s*[集话話]""")
 private val enEpisode = Regex("""(?:ep(?:isode)?\.?\s*|e)([0-9]{1,3})""")
 private val seasonEpisode = Regex("""s([0-9]{1,2})\s*e([0-9]{1,3})""")
 private val yearPattern = Regex("""(?:19|20)[0-9]{2}""")
-private val extras = Regex("预告|預告|花絮|先导|先導|幕后|幕後|特辑|特輯|番外|删减|刪減|trailer|teaser|preview|behind the scenes")
-private val whitespace = Regex("""\s+""")
+private val extras = Regex("预告|預告|片花|花絮|先导|先導|幕后|幕後|特辑|特輯|番外|删减|刪減|trailer|teaser|preview|behind the scenes")
+private val whitespace = Regex("""[\s\p{Z}]+""")
 private data class WorkTitle(val title: String, val season: Int?)
 private data class Segment(val season: Int?, val number: Int?)
 
 private fun normalized(value: String): String =
     Normalizer.normalize(value, Normalizer.Form.NFKC).trim().lowercase(Locale.ROOT)
         .replace(whitespace, " ")
+
+// Keep semantic symbols, including compatibility characters such as ². Fold full-width ASCII
+// separately: search ranking may ignore punctuation, but film identity cannot.
+private fun identityTitle(value: String): String {
+    val folded = buildString(value.length) {
+        for (c in value) append(if (c in '\uFF01'..'\uFF5E') (c.code - 0xFEE0).toChar() else c)
+    }
+    return Normalizer.normalize(folded, Normalizer.Form.NFC).lowercase(Locale.ROOT)
+        .replace(whitespace, " ").trim()
+}
+
+internal fun sameFilmTitle(left: String, right: String): Boolean = identityTitle(left) == identityTitle(right)
 
 private fun number(text: String): Int? {
     text.toIntOrNull()?.let { return it.takeIf { n -> n > 0 } }
@@ -34,7 +46,7 @@ private fun number(text: String): Int? {
 }
 
 private fun workTitle(raw: String): WorkTitle {
-    val text = normalized(raw)
+    val text = identityTitle(raw)
     val match = seasonSuffix.find(text) ?: return WorkTitle(text, null)
     val season = number(match.groupValues.drop(1).first { it.isNotEmpty() })
         ?: return WorkTitle(text, null)
@@ -71,8 +83,12 @@ internal fun suggestSwitchEpisode(
     target: FilmHit,
     refreshedLines: List<PlayLine>,
     candidates: List<FilmHit>,
+    originDetailCategory: String = "",
+    targetDetailCategory: String = "",
 ): EpisodeMatch? {
     if (episode == null || origin.source.id == target.source.id) return null
+    if (listOf(origin.film.category, originDetailCategory, target.film.category, targetDetailCategory)
+            .any { extras.containsMatchIn(normalized(it)) }) return null
     val from = workTitle(origin.film.title)
     val to = workTitle(target.film.title)
     if (from.title.isEmpty() || from.title != to.title || extras.containsMatchIn(from.title)) return null

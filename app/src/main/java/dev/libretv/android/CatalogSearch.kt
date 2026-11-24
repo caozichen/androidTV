@@ -20,6 +20,7 @@ internal data class SourceSearchUpdate(
     val pages: Int,
     val done: Boolean,
     val error: String? = null,
+    val truncated: Boolean = false,
 )
 
 private val punctuation = Regex("[\\p{Z}\\p{P}\\p{S}\\s]+")
@@ -75,10 +76,12 @@ internal suspend fun searchCatalogPages(
             var total = 1
             var page = 1
             var error: String? = null
+            var truncated = false
+            val dispatch = SearchDispatchState()
             val completed = withTimeoutOrNull(deadlineMs) {
                 while (page <= total) {
                     val result = try {
-                        fetch(source, query, page)
+                        withContext(dispatch) { fetch(source, query, page) }
                     } catch (e: CancellationException) {
                         throw e
                     } catch (e: Exception) {
@@ -86,7 +89,10 @@ internal suspend fun searchCatalogPages(
                         page++
                         continue
                     }
-                    if (page == 1) total = result.totalPages.coerceIn(1, 5)
+                    if (page == 1) {
+                        truncated = result.totalPages > 5
+                        total = result.totalPages.coerceIn(1, 5)
+                    }
                     ranked = withContext(Dispatchers.Default) {
                         for (film in result.films) {
                             if (!filterAdult || !isAdultCategory(film.category)) films.putIfAbsent(film.id, film)
@@ -94,14 +100,18 @@ internal suspend fun searchCatalogPages(
                         rankFilms(films.values.toList(), query, filterAdult = false)
                     }
                     completedPages++
-                    if (page < total) send(SourceSearchUpdate(source, ranked, completedPages, done = false, error))
+                    if (page < total) send(SourceSearchUpdate(source, ranked, completedPages, done = false, error, truncated))
                     if (page == 1 && total > 1) submitted.await()
                     page++
                 }
                 true
             }
-            if (completed == null) error = "点播源搜索超时，请稍后重试或换源"
-            send(SourceSearchUpdate(source, ranked, completedPages, done = true, error))
+            if (completed == null) error = if (dispatch.expiredInQueue) {
+                "等待请求名额超时，请重试"
+            } else {
+                "点播源搜索超时，请稍后重试或换源"
+            }
+            send(SourceSearchUpdate(source, ranked, completedPages, done = true, error, truncated))
         }
         // Each source has entered its homepage fetch before pagination can enqueue more HTTP calls.
         submitted.complete(Unit)

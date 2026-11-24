@@ -151,7 +151,7 @@ class SearchEngineTest {
         searchCatalogPages(listOf(a), "a海岸", 2_000, { _, _, _ -> CatalogPage(listOf(partial, hidden, exact), 2) }, updates::add)
         assertTrue(updates.all { it.films == listOf(exact, partial) })
         val page = parseCatalogPage("""{"pagecount":"100","list":[{"vod_id":17,"vod_name":"短片","type_name":"纪录片"}]}""")
-        assertEquals(5, page.totalPages)
+        assertEquals(100, page.totalPages)
         assertEquals("纪录片", page.films.single().category)
         assertFalse(isAdultCategory("家庭伦理剧"))
         assertFalse(isAdultCategory("成人教育"))

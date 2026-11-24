@@ -90,7 +90,11 @@ internal fun CatalogScreen(state: CatalogState) {
                             state.searching -> "加载中"
                             else -> "已取消"
                         }
-                        Text("${u.source.name} · ${u.pages} 页 · ${u.films.size} 条 · $outcome", style = MaterialTheme.typography.bodySmall)
+                        val cap = if (u.truncated) " · 仅前 5 页" else ""
+                        Text("${u.source.name} · ${u.pages} 页 · ${u.films.size} 条 · $outcome$cap", style = MaterialTheme.typography.bodySmall)
+                        if (u.done && u.error != null) TextButton(onClick = { state.retrySource(u.source.id) }) {
+                            Text("重试此源")
+                        }
                     }
                     items(state.hits, key = { "film:${it.source.id}:${it.film.id}" }) { entry ->
                         FilmButton(entry, state.sourceLabel(entry)) { state.open(entry) }
@@ -104,7 +108,7 @@ internal fun CatalogScreen(state: CatalogState) {
                         val options = state.sourceOptions()
                         if (options.isEmpty()) item { Text(if (state.searching) "正在等待其他片源" else "当前搜索没有其他来源，请返回搜索调整关键词或片源") }
                         items(options, key = { "switch:${it.source.id}:${it.film.id}" }) { option ->
-                            FilmButton(option, state.sourceLabel(option)) { state.open(option, switch = true) }
+                            FilmButton(option, state.sourceLabel(option) + " · 条目 " + option.film.id) { state.open(option, switch = true) }
                         }
                     } else {
                         item { TextButton(onClick = { state.choosingSource = true }) { Text("换源") } }
