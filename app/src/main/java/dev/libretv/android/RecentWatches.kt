@@ -1,9 +1,10 @@
 package dev.libretv.android
 
 import androidx.compose.foundation.layout.*
+import androidx.compose.foundation.lazy.LazyColumn
+import androidx.compose.foundation.lazy.items
 import androidx.compose.material3.*
 import androidx.compose.runtime.*
-import androidx.compose.runtime.saveable.rememberSaveable
 import androidx.compose.ui.Alignment
 import androidx.compose.ui.Modifier
 import androidx.compose.ui.unit.dp
@@ -14,50 +15,63 @@ private fun watchTime(ms: Long): String {
     return "%d:%02d".format(Locale.ROOT, seconds / 60, seconds % 60)
 }
 
+internal fun historySourceLabel(entry: WatchRecord, sources: Map<String, StoredSource>, repeatedNames: Set<String>): String {
+    val source = sources[entry.sourceId]
+    val name = source?.name ?: entry.sourceName
+    val label = if (source == null || name in repeatedNames) {
+        val prefix = entry.sourceId.take(6)
+        val ambiguous = sources.values.any { it.id != entry.sourceId && it.name == name && it.id.startsWith(prefix) }
+        "$name · ${if (ambiguous || source == null) entry.sourceId else prefix}"
+    } else name
+    return when {
+        source == null -> "$label（已移除）"
+        !source.enabled -> "$label（已停用）"
+        else -> label
+    }
+}
+
 @Composable
-internal fun RecentWatches(state: CatalogState) {
-    var clearing by rememberSaveable { mutableStateOf(false) }
-    var expanded by rememberSaveable { mutableStateOf(false) }
-    var deleting by remember { mutableStateOf<WatchRecord?>(null) }
-    Column {
-        Row(verticalAlignment = Alignment.CenterVertically) {
-            Text("最近观看", Modifier.weight(1f), style = MaterialTheme.typography.titleMedium)
-            TextButton(onClick = { clearing = true }) { Text("清空历史") }
-        }
-        val entries = if (expanded) state.recent else state.recent.take(3)
-        entries.forEach { entry ->
-            val source = state.managerRows.find { it.id == entry.sourceId }
-            val sourceLabel = when {
-                source == null -> "${entry.sourceName}（已移除）"
-                !source.enabled -> "${source.name}（已停用）"
-                else -> source.name
+internal fun RecentWatchRow(entry: WatchRecord, source: String, enabled: Boolean, open: () -> Unit, delete: () -> Unit) {
+    Row(verticalAlignment = Alignment.CenterVertically) {
+        TextButton(onClick = open, enabled = enabled, modifier = Modifier.weight(1f)) {
+            Column(Modifier.fillMaxWidth()) {
+                Text(entry.title, style = MaterialTheme.typography.titleMedium)
+                Text(listOf(entry.year, source, entry.lineName, entry.episodeName).filter { it.isNotBlank() }.joinToString(" · "),
+                    style = MaterialTheme.typography.bodySmall)
+                val duration = if (entry.durationMs > 0) " / ${watchTime(entry.durationMs)}" else ""
+                Text(if (entry.completed) "已看完" else watchTime(entry.positionMs) + duration)
             }
-            Row(verticalAlignment = Alignment.CenterVertically) {
-                TextButton(onClick = { state.openHistory(entry) }, enabled = !state.busy, modifier = Modifier.weight(1f)) {
-                    Column(Modifier.fillMaxWidth()) {
-                        Text(entry.title, style = MaterialTheme.typography.titleMedium)
-                        Text("$sourceLabel · ${entry.lineName} · ${entry.episodeName}", style = MaterialTheme.typography.bodySmall)
-                        val duration = if (entry.durationMs > 0) " / ${watchTime(entry.durationMs)}" else ""
-                        Text(if (entry.completed) "已看完" else watchTime(entry.positionMs) + duration)
+        }
+        TextButton(onClick = delete) { Text("删除") }
+    }
+}
+
+@Composable
+internal fun HistoryConfirmation(title: String, message: String, action: String, confirm: () -> Unit, dismiss: () -> Unit) {
+    AlertDialog(onDismissRequest = dismiss, title = { Text(title) }, text = { Text(message) },
+        confirmButton = { TextButton(onClick = confirm) { Text(action) } },
+        dismissButton = { TextButton(onClick = dismiss) { Text("取消") } })
+}
+
+@Composable
+internal fun EpisodeHistoryActions(state: CatalogState, hit: FilmHit, label: (WatchRecord) -> String) {
+    val stored by remember(hit.ref) { state.episodeHistory(hit.ref) }.collectAsState(emptyList())
+    val records = remember(stored, state.filterAdult, state.managerRows) { stored.filter(state::historyVisible) }
+    var choosing by remember(hit.ref) { mutableStateOf(false) }
+    var target by remember(hit.ref) { mutableStateOf<WatchRecord?>(null) }
+    if (records.isNotEmpty()) TextButton(onClick = { choosing = true }) { Text("清除单集进度") }
+    if (choosing) AlertDialog(onDismissRequest = { choosing = false }, title = { Text("选择要清除进度的剧集") },
+        text = {
+            LazyColumn(Modifier.heightIn(max = 360.dp)) {
+                items(records) { record ->
+                    TextButton(onClick = { choosing = false; target = record }) {
+                        Text("${record.lineName} · ${record.episodeName} · ${watchTime(record.positionMs)}")
                     }
                 }
-                TextButton(onClick = { deleting = entry }) { Text("删除") }
             }
-        }
-        if (state.recent.size > 3) TextButton(onClick = { expanded = !expanded }) {
-            Text(if (expanded) "收起历史" else "查看全部历史（${state.recent.size}）")
-        }
-    }
-    val entry = deleting
-    if (clearing || entry != null) {
-        val dismiss = { clearing = false; deleting = null }
-        AlertDialog(onDismissRequest = dismiss,
-            title = { Text(if (clearing) "清空观看历史？" else "删除观看记录？") },
-            text = { Text(if (entry == null) "同时删除所有分集的播放进度。" else "同时删除此来源下《${entry.title}》所有分集的进度。") },
-            confirmButton = { TextButton(onClick = {
-                if (clearing) state.clearHistory() else entry?.let { state.deleteHistory(it.ref.video) }
-                dismiss()
-            }) { Text(if (clearing) "确认清空" else "确认删除") } },
-            dismissButton = { TextButton(onClick = dismiss) { Text("取消") } })
+        }, confirmButton = { TextButton(onClick = { choosing = false }) { Text("取消") } })
+    target?.let { record ->
+        HistoryConfirmation("清除单集进度？", "《${record.title}》 ${record.year}\n${label(record)} · ${record.lineName} · ${record.episodeName}",
+            "确认清除", { state.clearEpisode(record.ref); target = null }, { target = null })
     }
 }

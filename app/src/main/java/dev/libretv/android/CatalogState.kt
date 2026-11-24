@@ -6,6 +6,7 @@ import androidx.compose.runtime.*
 import androidx.lifecycle.viewModelScope
 import androidx.lifecycle.SavedStateHandle
 import kotlinx.coroutines.flow.first
+import kotlinx.coroutines.flow.collectLatest
 import kotlinx.coroutines.CancellationException
 import kotlinx.coroutines.Job
 import kotlinx.coroutines.CoroutineStart
@@ -29,12 +30,19 @@ internal data class FilmHit(val source: CmsSource, val film: Film) {
 
 internal class CatalogState(app: Application, private val savedState: SavedStateHandle) : SourceManagerState(app) {
     private val history = HistoryStore.open(app)
-    var recent by mutableStateOf(emptyList<WatchRecord>())
-        private set
+    private var latestDetail by mutableStateOf<WatchRecord?>(null)
+    fun homeHistory(filter: Boolean, limit: Int) = history.recent(filter, limit)
+    fun episodeHistory(video: VideoRef) = history.episodes(video)
+    fun historyVisible(entry: WatchRecord): Boolean {
+        if (!filterAdult) return true
+        val source = managerRows.firstOrNull { it.id == entry.sourceId }
+        return !entry.categoryAdult && source?.isAdult != true && (entry.sourceAdult ?: source?.isAdult) == false
+    }
     private var playRequest: Job? = null
     private var historyResume: EpisodeRef? = null
     private var resumePaused = false
     private var manuallyChosenLine = false
+    private var pendingEpisodeChoice by mutableStateOf(false)
     var managing by mutableStateOf(false)
     var environment by mutableStateOf(false)
     var query by mutableStateOf(SAMPLE)
@@ -83,12 +91,17 @@ internal class CatalogState(app: Application, private val savedState: SavedState
 
     init {
         refreshSources()
-        viewModelScope.launch { history.recent.collect { recent = it } }
+        viewModelScope.launch {
+            snapshotFlow { detail?.ref?.takeIf { player == null } }.collectLatest { video ->
+                latestDetail = null
+                if (video != null) history.latest(video).collect { latestDetail = it }
+            }
+        }
         val parts = savedState.get<ArrayList<String>>("playingRef")
         if (parts?.size == 4) viewModelScope.launch {
             snapshotFlow { busy }.first { !it }
             val ref = EpisodeRef(VideoRef(parts[0], parts[1]), parts[2], parts[3])
-            val entry = history.recent.first().find { it.ref.video == ref.video }
+            val entry = history.progress(ref) ?: history.latest(ref.video).first()
             savedState.remove<ArrayList<String>>("playingRef")
             if (entry != null && detail == null && !managing && !environment) openHistory(entry, ref, true)
         }
@@ -96,10 +109,21 @@ internal class CatalogState(app: Application, private val savedState: SavedState
 
     fun deleteHistory(video: VideoRef) { viewModelScope.launch { history.delete(video) } }
     fun clearHistory() { viewModelScope.launch { history.clear() } }
+    fun clearEpisode(ref: EpisodeRef) {
+        history.deleteEpisode(ref)
+        if (lastEpisode == ref) {
+            lastEpisode = null
+            selectedEpisode = null
+        }
+        if (historyResume == ref) {
+            historyResume = null
+            pendingEpisodeChoice = false
+        }
+    }
 
     fun openHistory(entry: WatchRecord, ref: EpisodeRef = entry.ref, paused: Boolean = false) {
         val source = managerRows.find { it.id == entry.sourceId }
-        if (source == null || !source.enabled || (filterAdult && (source.isAdult || isAdultCategory(entry.category)))) {
+        if (source == null || !source.enabled || !historyVisible(entry)) {
             notice = when {
                 source == null -> "片源已移除，请在点播源管理重新添加原端点"
                 !source.enabled -> "片源已停用，请在点播源管理启用后继续观看"
@@ -181,7 +205,9 @@ internal class CatalogState(app: Application, private val savedState: SavedState
     fun chooseOtherSource() {
         val hit = detail ?: return
         if (player != null) back()
-        if (updates.isEmpty()) search(hit.film.title, refresh = true)
+        if (updates.isEmpty() || (historyResume != null && !sameFilmTitle(searchedTerm, hit.film.title))) {
+            search(hit.film.title, refresh = true)
+        }
         choosingSource = true
     }
 
@@ -230,6 +256,7 @@ internal class CatalogState(app: Application, private val savedState: SavedState
         historyResume = resume
         resumePaused = paused
         manuallyChosenLine = false
+        pendingEpisodeChoice = false
         val old = detail
         val previousEpisode = selectedEpisode
         val previousLines = lines
@@ -263,7 +290,12 @@ internal class CatalogState(app: Application, private val savedState: SavedState
                 }
                 lines = fresh.lines
                 verifiedDetail = fresh.confirms(hit.film)
-                sameSourceVerified = fresh.film?.sameHistoryFilm(hit.film) == true
+                val canonical = hit.film.withVerifiedDetail(fresh.film)
+                if (canonical != null) {
+                    // Retain the original search category for the cross-source trailer checks.
+                    detail = hit.copy(film = canonical.copy(category = hit.film.category.ifBlank { canonical.category }))
+                }
+                sameSourceVerified = canonical != null && fresh.film?.sameHistoryFilm(canonical) == true
                 detailCategory = fresh.film?.category.orEmpty()
                 val targetComplete = updates[hit.source.id]?.let { it.done && it.error == null && !it.truncated } == true
                 val match = if (switch && old != null && verifiedOrigin && verifiedDetail && targetComplete) {
@@ -280,11 +312,15 @@ internal class CatalogState(app: Application, private val savedState: SavedState
                     else -> ""
                 }
                 if (resume != null && lines.isNotEmpty()) {
-                    val location = if (sameSourceVerified) locateEpisode(lines, resume) else null
+                    val confirmed = canonical != null && canonical.sameHistoryFilm(hit.film)
+                    val location = if (sameSourceVerified && confirmed) locateEpisode(lines, resume) else null
                     if (location != null) {
                         lineIndex = location.lineIndex
-                        play(location.episodeIndex, paused)
-                    } else detailStatus = "上次剧集无法唯一确认，请重新选集"
+                        play(location.episodeIndex, paused, explicitSelection = false)
+                    } else {
+                        pendingEpisodeChoice = true
+                        detailStatus = "上次剧集无法唯一确认，请重新选集"
+                    }
                 }
             } catch (e: CancellationException) {
                 throw e
@@ -303,10 +339,12 @@ internal class CatalogState(app: Application, private val savedState: SavedState
     fun detailHistory(): WatchRecord? {
         val hit = detail ?: return null
         if (manuallyChosenLine) return null
-        return recent.firstOrNull { it.ref.video == hit.ref && hit.film.sameHistoryFilm(Film(it.vodId, it.title, it.year)) }
+        return latestDetail?.takeIf { it.ref.video == hit.ref && historyVisible(it) &&
+            hit.film.sameHistoryFilm(Film(it.vodId, it.title, it.year)) }
     }
 
     fun nextAfterCompletion(): EpisodeMatch? {
+        if (requiresEpisodeSelection()) return null
         val previous = detailHistory()?.takeIf { it.completed } ?: return null
         if (!sameSourceVerified || (lastEpisode != null && lastEpisode != previous.ref)) return null
         val current = locateEpisode(lines, previous.ref) ?: return null
@@ -317,21 +355,28 @@ internal class CatalogState(app: Application, private val savedState: SavedState
     fun playNextAfterCompletion() {
         val next = nextAfterCompletion() ?: return
         lineIndex = next.lineIndex
-        play(next.episodeIndex)
+        play(next.episodeIndex, explicitSelection = false)
+    }
+
+    fun requiresEpisodeSelection(): Boolean {
+        if (pendingEpisodeChoice) return true
+        val ref = lastEpisode ?: detailHistory()?.ref ?: return false
+        return !sameSourceVerified || locateEpisode(lines, ref) == null
     }
 
     fun primaryPlay() {
+        if (requiresEpisodeSelection()) return
         val preferred = lastEpisode
         val previous = detailHistory()
         val ref = preferred ?: previous?.ref
-        if (ref == null) { play(0); return }
+        if (ref == null) { play(0, explicitSelection = false); return }
         val loc = if (sameSourceVerified) locateEpisode(lines, ref) else null
         if (loc == null) {
             detailStatus = "上次剧集无法唯一确认，请重新选集"
             return
         }
         lineIndex = loc.lineIndex
-        play(loc.episodeIndex)
+        play(loc.episodeIndex, explicitSelection = false)
     }
 
     fun selectLine(index: Int) {
@@ -362,7 +407,7 @@ internal class CatalogState(app: Application, private val savedState: SavedState
         selectedEpisode = lines[lineIndex].episodes[index]
     }
 
-    fun play(index: Int, paused: Boolean = false) {
+    fun play(index: Int, paused: Boolean = false, explicitSelection: Boolean = true) {
         val hit = detail ?: return
         val film = hit.film
         val ref = episodeRef(index) ?: return
@@ -370,12 +415,23 @@ internal class CatalogState(app: Application, private val savedState: SavedState
         val episode = selectedEpisode ?: return
         val line = lines[lineIndex]
         val label = line.episodeLabels()[index]
+        val category = if (isAdultCategory(film.category)) film.category else detailCategory.ifBlank { film.category }
         val meta = WatchRecord(ref.video.sourceId, ref.video.vodId, ref.lineId, ref.episodeId,
-            hit.source.name, film.title, film.year, film.category, line.name, label)
+            hit.source.name, film.title, film.year, category, line.name, label,
+            sourceAdult = managerRows.find { it.id == ref.video.sourceId }?.isAdult)
         playRequest?.cancel()
         playRequest = viewModelScope.launch {
             val previous = if (sameSourceVerified && locateEpisode(lines, ref) != null) history.progress(ref) else null
-            val start = previous?.takeIf { !it.completed && film.sameHistoryFilm(Film(it.vodId, it.title, it.year)) }?.positionMs ?: 0L
+            val savedFilm = previous?.let { Film(it.vodId, it.title, it.year) }
+            if (!explicitSelection && savedFilm != null && !film.sameHistoryFilm(savedFilm) &&
+                film.acceptsWatchRecord(savedFilm, explicitSelection = true)) {
+                pendingEpisodeChoice = true
+                detailStatus = "上次剧集无法唯一确认，请重新选集"
+                return@launch
+            }
+            val start = if (previous != null && !previous.completed && savedFilm != null &&
+                film.acceptsWatchRecord(savedFilm, explicitSelection)) previous.positionMs else 0L
+            pendingEpisodeChoice = false
             player = PlaybackSelection("${film.title} · $label", episode.url, ref, index, history.begin(meta), start, paused)
             savedState["playingRef"] = arrayListOf(ref.video.sourceId, ref.video.vodId, ref.lineId, ref.episodeId)
         }
@@ -402,6 +458,7 @@ internal class CatalogState(app: Application, private val savedState: SavedState
             historyResume = null
             verifiedDetail = safeFilm && fresh.confirms(hit.film)
             sameSourceVerified = safeFilm
+            pendingEpisodeChoice = safeFilm
             detailCategory = fresh.film?.category.orEmpty()
             detailStatus = if (safeFilm) "来源的剧集已变化，请重新选集" else "来源的影片信息已变化，请返回搜索重新确认"
             return null
@@ -409,8 +466,9 @@ internal class CatalogState(app: Application, private val savedState: SavedState
         lines = fresh.lines
         lineIndex = match.lineIndex
         rememberEpisode(match.episodeIndex)
-        player = selection.copy(index = match.episodeIndex)
-        return lines[lineIndex].episodes[match.episodeIndex].url
+        val resolvedUrl = lines[lineIndex].episodes[match.episodeIndex].url
+        player = selection.copy(index = match.episodeIndex, url = resolvedUrl)
+        return resolvedUrl
     }
 
     fun playControl() {

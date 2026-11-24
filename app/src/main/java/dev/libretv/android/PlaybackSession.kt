@@ -421,10 +421,11 @@ internal fun rememberPlaybackSession(sessionKey: Any, url: String, initialPositi
     val activity = LocalActivity.current as ComponentActivity
     val lifecycle = activity.lifecycle
     val scope = rememberCoroutineScope()
-    val position = rememberSaveable(sessionKey, url) { mutableLongStateOf(initialPositionMs.coerceAtLeast(0)) }
-    val intent = rememberSaveable(sessionKey, url) { mutableStateOf(!initiallyPaused) }
-    val refreshUsed = rememberSaveable(sessionKey, url) { mutableStateOf(false) }
-    val session = remember(sessionKey, url, lifecycle) {
+    // A resolved URL may change in the same watch. Only a new selection starts new playback state.
+    val position = rememberSaveable(sessionKey) { mutableLongStateOf(initialPositionMs.coerceAtLeast(0)) }
+    val intent = rememberSaveable(sessionKey) { mutableStateOf(!initiallyPaused) }
+    val refreshUsed = rememberSaveable(sessionKey) { mutableStateOf(false) }
+    val session = remember(sessionKey, lifecycle) {
         PlaybackSession(context, url, scope, position, intent, refreshUsed, onCheckpoint, refreshUrl)
     }
     DisposableEffect(session) {

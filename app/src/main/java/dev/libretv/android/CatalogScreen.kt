@@ -42,6 +42,22 @@ internal fun CatalogScreen(state: CatalogState) {
         state.managing -> SourceManagerScreen(state, state::back)
         state.environment -> EnvironmentScreen(onBack = state::back)
         else -> Surface(Modifier.fillMaxSize()) {
+            val sources = remember(state.managerRows) { state.managerRows.associateBy { it.id } }
+            val repeated = remember(sources) { sources.values.groupingBy { it.name }.eachCount().filterValues { it > 1 }.keys }
+            val sourceLabel = { record: WatchRecord -> historySourceLabel(record, sources, repeated) }
+            var limit by rememberSaveable(state.filterAdult) { mutableIntStateOf(3) }
+            val records = if (hit == null) key(state.filterAdult) {
+                val flow = remember(limit) { state.homeHistory(state.filterAdult, limit + 1) }
+                flow.collectAsState(emptyList()).value
+            } else emptyList()
+            var clearing by remember { mutableStateOf(false) }
+            var deleting by remember { mutableStateOf<WatchRecord?>(null) }
+            deleting?.let { record ->
+                HistoryConfirmation("删除观看记录？", "删除《${record.title}》 ${record.year}\n${sourceLabel(record)} 下所有分集的进度。",
+                    "确认删除", { state.deleteHistory(record.ref.video); deleting = null }, { deleting = null })
+            }
+            if (clearing) HistoryConfirmation("清空观看历史？", "同时删除所有来源及分集的播放进度，包括过滤隐藏的记录。",
+                "确认清空", { state.clearHistory(); clearing = false }, { clearing = false })
             LazyColumn(
                 state = if (hit == null) homeScroll else detailScroll,
                 modifier = Modifier.fillMaxSize().windowInsetsPadding(WindowInsets.safeDrawing).imePadding(),
@@ -95,7 +111,23 @@ internal fun CatalogScreen(state: CatalogState) {
                         Text("搜索中 · 已完成 ${state.updates.values.count { it.done }} / ${state.updates.size} 个片源")
                     }
                     if (state.notice.isNotBlank()) item { Text(state.notice) }
-                    if (state.recent.isNotEmpty()) item { RecentWatches(state) }
+                    if (records.isNotEmpty()) {
+                        item {
+                            Row(verticalAlignment = androidx.compose.ui.Alignment.CenterVertically) {
+                                Text("最近观看", Modifier.weight(1f), style = MaterialTheme.typography.titleMedium)
+                                TextButton(onClick = { clearing = true }) { Text("清空历史") }
+                            }
+                        }
+                        items(records.take(limit), key = { "history:${it.sourceId.length}:${it.sourceId}${it.vodId}" }) { record ->
+                            RecentWatchRow(record, sourceLabel(record), !state.busy, { state.openHistory(record) }, { deleting = record })
+                        }
+                        item {
+                            Row {
+                                if (records.size > limit) TextButton(onClick = { limit += 20 }) { Text("查看更多历史") }
+                                if (limit > 3) TextButton(onClick = { limit = 3 }) { Text("收起历史") }
+                            }
+                        }
+                    }
                     if (state.updates.isNotEmpty()) item {
                         Row {
                             TextButton(onClick = { showProgress = !showProgress }) { Text("各源状态") }
@@ -134,8 +166,9 @@ internal fun CatalogScreen(state: CatalogState) {
                         if (!state.loadingDetail && state.lines.isEmpty()) item {
                             TextButton(onClick = { state.reloadDetail(hit) }) { Text("重新加载") }
                         }
+                        item { EpisodeHistoryActions(state, hit, sourceLabel) }
                         if (state.lines.isNotEmpty()) {
-                            item {
+                            if (!state.requiresEpisodeSelection()) item {
                                 val previous = state.detailHistory()
                                 val text = when {
                                     state.lastEpisode != null && state.lastEpisode != previous?.ref -> "播放已选剧集"

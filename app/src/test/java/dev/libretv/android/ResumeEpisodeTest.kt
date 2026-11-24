@@ -35,4 +35,27 @@ class ResumeEpisodeTest {
         assertFalse(original.sameHistoryFilm(original.copy(id = "8")))
         assertTrue(original.sameHistoryFilm(original.copy(title = "Ａ＋Ｂ")))
     }
+
+    @Test fun freshDetailsSupplyYearAndStoredClassificationForANewWatch() {
+        val summary = Film("77", "测试专辑", "", "合集")
+        val detail = summary.copy(year = "2024", category = "Adult")
+        val canonical = summary.withVerifiedDetail(detail)!!
+        assertEquals("2024", canonical.year)
+        assertEquals("Adult", canonical.category)
+        assertTrue(canonical.acceptsWatchRecord(detail, explicitSelection = false))
+        assertEquals("Adult", detail.withVerifiedDetail(detail.copy(category = "合集"))!!.category)
+    }
+
+    @Test fun aMissingYearRequiresManualSelectionToReuseAnOldCheckpoint() {
+        val current = Film("99", "Series+", "2024")
+        val legacy = current.copy(year = "")
+        assertFalse(current.acceptsWatchRecord(legacy, explicitSelection = false))
+        assertTrue(current.acceptsWatchRecord(legacy, explicitSelection = true))
+        assertFalse(current.acceptsWatchRecord(legacy.copy(title = "Series-"), explicitSelection = true))
+        assertFalse(current.acceptsWatchRecord(legacy.copy(id = "different"), explicitSelection = true))
+        assertFalse(current.acceptsWatchRecord(current.copy(year = "2025"), explicitSelection = true))
+        assertNull(current.withVerifiedDetail(current.copy(year = "2025")))
+        assertNull(current.withVerifiedDetail(current.copy(id = "another")))
+        assertNull(current.withVerifiedDetail(current.copy(title = "Series-")))
+    }
 }

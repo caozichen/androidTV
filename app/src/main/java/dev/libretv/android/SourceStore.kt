@@ -13,6 +13,8 @@ import androidx.room.Query
 import androidx.room.Room
 import androidx.room.RoomDatabase
 import androidx.room.withTransaction
+import androidx.room.migration.Migration
+import androidx.sqlite.db.SupportSQLiteDatabase
 import com.google.gson.GsonBuilder
 import com.google.gson.JsonObject
 import com.google.gson.JsonParseException
@@ -72,7 +74,7 @@ internal interface SourceDao {
 
 @Database(
     entities = [SourceRow::class, CompletedSourceMigration::class, WatchRecord::class, WatchPointer::class],
-    version = 2, exportSchema = true, autoMigrations = [AutoMigration(from = 1, to = 2)],
+    version = 3, exportSchema = true, autoMigrations = [AutoMigration(from = 1, to = 2)],
 )
 internal abstract class SourceDatabase : RoomDatabase() {
     abstract fun sources(): SourceDao
@@ -83,8 +85,32 @@ internal abstract class SourceDatabase : RoomDatabase() {
 
         fun open(context: Context): SourceDatabase = instance ?: synchronized(this) {
             instance ?: Room.databaseBuilder(context.applicationContext, SourceDatabase::class.java, "catalog.db")
+                .addMigrations(historyMigration)
                 .build().also { instance = it }
         }
+    }
+}
+
+private val historyMigration = object : Migration(2, 3) {
+    override fun migrate(db: SupportSQLiteDatabase) {
+        db.execSQL("ALTER TABLE episode_progress ADD COLUMN sourceAdult INTEGER")
+        db.execSQL("ALTER TABLE episode_progress ADD COLUMN categoryAdult INTEGER NOT NULL DEFAULT 0")
+        db.execSQL("ALTER TABLE episode_progress ADD COLUMN watchOrder INTEGER NOT NULL DEFAULT 0")
+        db.execSQL("CREATE INDEX index_watch_history_viewOrder ON watch_history (viewOrder)")
+        db.execSQL("""UPDATE episode_progress SET sourceAdult =
+            (SELECT isAdult FROM sources WHERE sources.id = episode_progress.sourceId)""")
+        val restricted = buildList {
+            db.query("SELECT DISTINCT category FROM episode_progress").use { rows ->
+                while (rows.moveToNext()) rows.getString(0).takeIf(::isAdultCategory)?.let(::add)
+            }
+        }
+        for (category in restricted) {
+            db.execSQL("UPDATE episode_progress SET categoryAdult = 1 WHERE category = ?", arrayOf(category))
+        }
+        db.execSQL("""UPDATE episode_progress SET watchOrder = COALESCE(
+            (SELECT h.viewOrder FROM watch_history h WHERE h.sourceId = episode_progress.sourceId
+             AND h.vodId = episode_progress.vodId AND h.lineId = episode_progress.lineId
+             AND h.episodeId = episode_progress.episodeId), 0)""")
     }
 }
 

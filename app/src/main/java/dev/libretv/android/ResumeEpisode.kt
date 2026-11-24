@@ -18,3 +18,15 @@ internal fun locateEpisode(lines: List<PlayLine>, ref: EpisodeRef): EpisodeMatch
 
 internal fun Film.sameHistoryFilm(other: Film): Boolean =
     id == other.id && title.isNotBlank() && sameFilmTitle(title, other.title) && year == other.year
+
+// A summary or old watch record can omit metadata that is present in the current details.
+internal fun Film.withVerifiedDetail(fresh: Film?): Film? {
+    if (fresh == null || id != fresh.id || fresh.title.isBlank() || !sameFilmTitle(title, fresh.title)) return null
+    if (year.isNotBlank() && fresh.year.isNotBlank() && year != fresh.year) return null
+    val watchCategory = if (isAdultCategory(category)) category else fresh.category.ifBlank { category }
+    return copy(year = fresh.year.ifBlank { year }, category = watchCategory)
+}
+
+internal fun Film.acceptsWatchRecord(saved: Film, explicitSelection: Boolean): Boolean =
+    sameHistoryFilm(saved) || (explicitSelection && saved.year.isBlank() && saved.id == id &&
+        title.isNotBlank() && sameFilmTitle(title, saved.title))

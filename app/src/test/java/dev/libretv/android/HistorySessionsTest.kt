@@ -34,4 +34,19 @@ class HistorySessionsTest {
         assertFalse(sessions.ownsEpisode(other))
         assertFalse(sessions.ownsLatest(replay))
     }
+
+    @Test fun clearingOneEpisodeRevokesOnlyItsOwnCallbacks() {
+        val first = begin("s1", "one")
+        val second = begin("s1", "two")
+        val other = begin("s2", "one")
+        sessions.delete(first.snapshot.ref)
+        assertFalse(sessions.ownsEpisode(first))
+        assertTrue(sessions.ownsLatest(second))
+        val replay = begin("s1", "one")
+        assertTrue(sessions.ownsEpisode(replay))
+        assertTrue(sessions.ownsEpisode(second))
+        sessions.delete(replay.snapshot.ref)
+        assertFalse(sessions.ownsLatest(replay))
+        assertTrue(sessions.ownsLatest(other))
+    }
 }
