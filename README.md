@@ -1,11 +1,11 @@
 # LibreTV Android
 
-阶段 7 候选版为 0.6.0（12）。正式包名为 `dev.libretv.android`，调试包为 `dev.libretv.android.debug`。升级演练包为 `dev.libretv.android.rehearsal`，各包独立保存数据。覆盖升级需使用相同包名、相同签名和更高版本号。
+阶段 7 修订版为 0.6.2（14）。桌面的「LibreTV」对应正式应用 `dev.libretv.android`，「LibreTV 调试版」对应 `dev.libretv.android.debug`，「LibreTV 演练版」对应 `dev.libretv.android.rehearsal`。三个版本各自保存数据，覆盖升级使用相同包名、相同签名和更高版本号。
 
 ## 首次正式签名
 
 1. 在本机 Android Studio 选 **Build → Generate Signed App Bundle or APK → APK → Create new**。在工程外的私人目录创建密钥库，例如 `~/.config/libretv-android/release/`。设置别名、独立生成的强密码和至少 25 年有效期。将密码保存在自己的密码管理器，后续发行复用同一把密钥。
-2. 将密钥库做一份独立加密备份。在另一目录打开备份，用 Studio JBR 的 `keytool -list -v -keystore /备份绝对路径 -alias 自己的别名` 检查密码可用并比对原件的 SHA-256 证书指纹。命令会在本机提示输入密码。
+2. 用 Studio JBR 的 `keytool -list -v -keystore /原始密钥库绝对路径 -alias 自己的别名` 查看私钥条目（PrivateKeyEntry），独立记录其公开证书 SHA-256。将密钥库做一份加密备份，再恢复到另一私人目录。按下方「验证备份恢复」实际用恢复件签署样本，成功后才将这份备份标为可恢复。密码与备份分开保管。
 3. 在私人目录准备 UTF-8 的 `signing.properties`。目录权限使用 `700`，配置及密钥库权限使用 `600`。用本机编辑器填入下列字段。路径需为绝对路径，特殊字符按 Java Properties 语法转义，反斜线写两次。若密钥格式要求密钥密码与库密码相同，两个字段填同一个密码。
 
 ```properties
@@ -16,20 +16,31 @@ storePassword=库密码
 keyPassword=密钥密码
 ```
 
-4. 在工程目录使用 Studio JBR 和现有 SDK 构建，并检查最终文件。将下例配置路径改成实际路径。核对包名、versionCode、证书公开指纹与交付记录。
+4. 从工程目录运行经过校验的交付命令。使用本机 Python 3、Studio JBR 和已有缓存的 Android SDK/Gradle 依赖，将环境变量换成实际值。签名用途、预期版本及独立记录的证书指纹任一不匹配时，命令会失败。交付路径须为新文件名。
 
 ```sh
 export JAVA_HOME='/Applications/Android Studio.app/Contents/jbr/Contents/Home'
 export ANDROID_HOME="$HOME/Library/Android/sdk"
 export LIBRETV_SIGNING_FILE="$HOME/.config/libretv-android/release/signing.properties"
-./gradlew --offline --no-configuration-cache clean :app:testDebugUnitTest :app:lintRelease :app:assembleRelease
-apk=app/build/outputs/apk/release/app-release.apk
-"$ANDROID_HOME/build-tools/36.0.0/apksigner" verify --verbose --print-certs "$apk"
-"$ANDROID_HOME/build-tools/36.0.0/aapt" dump badging "$apk" | head -1
-shasum -a 256 "$apk"
+export LIBRETV_EXPECTED_CERT_SHA256='填写独立记录的正式证书SHA-256'
+python3 tools/release.py build release \
+  --cert-sha256 "$LIBRETV_EXPECTED_CERT_SHA256" --version-name 0.6.2 --version-code 14 \
+  --output "$HOME/Downloads/LibreTV-0.6.2-release.apk"
 ```
 
-本机演练时，选择仓库外的演练配置（`purpose=rehearsal`）并给 Gradle 加上 `-PlibretvRehearsal=true`。签名用途与构建模式必须匹配。普通调试构建可在未设置 `LIBRETV_SIGNING_FILE` 的终端运行。手机首次安装正式包时会建立独立数据目录。
+演练时选择仓库外的 `purpose=rehearsal` 配置，改用 `build rehearsal`、独立记录的演练证书指纹及新的演练交付文件名。脚本运行 clean、单测、release Lint、签名和 APK 打包，验证待交付副本的包名、版本与证书后才输出新文件及文件哈希。上次构建留下的中间目录不作为交付入口。
+
+脚本通过单次 Gradle 调用参数 `-PlibretvSignRelease=true` 开启凭据读取。手动构建签名 AAB 时在同一环境执行 `./gradlew --offline --no-configuration-cache -PlibretvSignRelease=true :app:bundleRelease`；演练再加 `-PlibretvRehearsal=true`。日常调试和 IDE 同步使用默认模式，即使终端保留了演练环境变量或旧配置路径，也无需读取签名文件。签名开关只用于单次发行任务。
+
+### 验证备份恢复
+
+从工程目录运行以下命令，使用恢复出来的密钥库和独立保存的预期指纹。样本可选本机已有的演练 APK。根据工具提示在本机输入备份所用库密码；如另有私钥密码，按提示输入。工具在临时目录签署副本并验证实际签名，原样本及备份保持可复用。仅含公钥证书的库、错误的私钥密码或其他私钥均不能通过。
+
+```sh
+python3 tools/release.py verify-backup \
+  --keystore '/已恢复的备份绝对路径' --alias '自己的别名' \
+  --sample-apk '/测试样本APK的绝对路径' --cert-sha256 "$LIBRETV_EXPECTED_CERT_SHA256"
+```
 
 ## 试用阶段 6 续播
 

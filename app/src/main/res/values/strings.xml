@@ -1,6 +1,8 @@
 <?xml version="1.0" encoding="utf-8"?>
 <resources>
     <string name="app_name">LibreTV</string>
+    <string name="debug_launcher_name">LibreTV 调试版</string>
+    <string name="rehearsal_launcher_name">LibreTV 演练版</string>
     <string name="stage_title">环境验证</string>
     <string name="database_title">Room 数据库</string>
     <string name="player_title">Media3 播放引擎</string>
