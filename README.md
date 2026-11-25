@@ -1,6 +1,35 @@
 # LibreTV Android
 
-阶段 6 修订版为 0.5.1（11）。调试包使用 `dev.libretv.android.debug`。点播源与观看历史保存在应用私有 Room 数据库，首页可搜索多个来源，或从「最近观看」继续。从 0.5.0 覆盖升级保留片源、历史与分集进度。
+阶段 7 候选版为 0.6.0（12）。正式包名为 `dev.libretv.android`，调试包为 `dev.libretv.android.debug`。升级演练包为 `dev.libretv.android.rehearsal`，各包独立保存数据。覆盖升级需使用相同包名、相同签名和更高版本号。
+
+## 首次正式签名
+
+1. 在本机 Android Studio 选 **Build → Generate Signed App Bundle or APK → APK → Create new**。在工程外的私人目录创建密钥库，例如 `~/.config/libretv-android/release/`。设置别名、独立生成的强密码和至少 25 年有效期。将密码保存在自己的密码管理器，后续发行复用同一把密钥。
+2. 将密钥库做一份独立加密备份。在另一目录打开备份，用 Studio JBR 的 `keytool -list -v -keystore /备份绝对路径 -alias 自己的别名` 检查密码可用并比对原件的 SHA-256 证书指纹。命令会在本机提示输入密码。
+3. 在私人目录准备 UTF-8 的 `signing.properties`。目录权限使用 `700`，配置及密钥库权限使用 `600`。用本机编辑器填入下列字段。路径需为绝对路径，特殊字符按 Java Properties 语法转义，反斜线写两次。若密钥格式要求密钥密码与库密码相同，两个字段填同一个密码。
+
+```properties
+purpose=release
+storeFile=/密钥库的绝对路径
+keyAlias=自己的别名
+storePassword=库密码
+keyPassword=密钥密码
+```
+
+4. 在工程目录使用 Studio JBR 和现有 SDK 构建，并检查最终文件。将下例配置路径改成实际路径。核对包名、versionCode、证书公开指纹与交付记录。
+
+```sh
+export JAVA_HOME='/Applications/Android Studio.app/Contents/jbr/Contents/Home'
+export ANDROID_HOME="$HOME/Library/Android/sdk"
+export LIBRETV_SIGNING_FILE="$HOME/.config/libretv-android/release/signing.properties"
+./gradlew --offline --no-configuration-cache clean :app:testDebugUnitTest :app:lintRelease :app:assembleRelease
+apk=app/build/outputs/apk/release/app-release.apk
+"$ANDROID_HOME/build-tools/36.0.0/apksigner" verify --verbose --print-certs "$apk"
+"$ANDROID_HOME/build-tools/36.0.0/aapt" dump badging "$apk" | head -1
+shasum -a 256 "$apk"
+```
+
+本机演练时，选择仓库外的演练配置（`purpose=rehearsal`）并给 Gradle 加上 `-PlibretvRehearsal=true`。签名用途与构建模式必须匹配。普通调试构建可在未设置 `LIBRETV_SIGNING_FILE` 的终端运行。手机首次安装正式包时会建立独立数据目录。
 
 ## 试用阶段 6 续播
 
