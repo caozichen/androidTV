@@ -1,5 +1,7 @@
 package dev.libretv.android
 
+import com.google.gson.JsonArray
+import com.google.gson.JsonObject
 import java.io.IOException
 import java.io.InterruptedIOException
 import java.net.UnknownHostException
@@ -8,6 +10,7 @@ import kotlin.coroutines.resume
 import kotlin.coroutines.resumeWithException
 import kotlin.coroutines.AbstractCoroutineContextElement
 import kotlin.coroutines.CoroutineContext
+import kotlin.time.TimeMark
 import kotlinx.coroutines.Dispatchers
 import kotlinx.coroutines.suspendCancellableCoroutine
 import kotlinx.coroutines.withContext
@@ -18,9 +21,7 @@ import okhttp3.HttpUrl.Companion.toHttpUrlOrNull
 import okhttp3.OkHttpClient
 import okhttp3.Request
 import okhttp3.Response
-import org.json.JSONArray
 import org.json.JSONException
-import org.json.JSONObject
 
 data class CmsSource(val name: String, val url: String, val id: String = url)
 data class Film(val id: String, val title: String, val year: String, val category: String = "")
@@ -57,16 +58,28 @@ internal fun catalogErrorText(error: Exception): String = when (error) {
 }
 
 // A search source can expire while OkHttp still holds its call in the global dispatcher queue.
-internal class SearchDispatchState : AbstractCoroutineContextElement(Key) {
+internal class CatalogQueueTimeout : IOException("等待请求名额超时，请重试")
+
+internal class SearchDispatchState(private val deadline: TimeMark) : AbstractCoroutineContextElement(Key) {
     companion object Key : CoroutineContext.Key<SearchDispatchState>
-    @Volatile var started = false
-    @Volatile var expiredInQueue = false
+    @Volatile var waitingForSlot = true
+        private set
+
+    fun enqueuePage() {
+        waitingForSlot = true
+    }
+
+    fun acquireSlot() {
+        // A previous call's timeout can free a slot before our own cancellation is delivered.
+        if (deadline.hasPassedNow()) throw CatalogQueueTimeout()
+        waitingForSlot = false
+    }
 }
 
 internal val catalogClient = OkHttpClient.Builder()
     .dispatcher(okhttp3.Dispatcher().apply { maxRequests = 4; maxRequestsPerHost = 4 })
     .addInterceptor { chain ->
-        chain.request().tag(SearchDispatchState::class.java)?.started = true
+        chain.request().tag(SearchDispatchState::class.java)?.acquireSlot()
         chain.proceed(chain.request())
     }
     .connectTimeout(8, TimeUnit.SECONDS)
@@ -77,7 +90,7 @@ internal val catalogClient = OkHttpClient.Builder()
 
 internal suspend fun checkCatalog(source: CmsSource) {
     val json = fetchCatalog(catalogUrl(source, mapOf("pg" to "1")))
-    withContext(Dispatchers.Default) { resultList(JSONObject(json)) }
+    withContext(Dispatchers.Default) { resultList(catalogObject(json)) }
 }
 
 suspend fun searchCatalog(source: CmsSource, query: String): List<Film> {
@@ -119,14 +132,11 @@ internal fun catalogUrl(source: CmsSource, parameters: Map<String, String>): Htt
 
 internal suspend fun fetchCatalog(url: HttpUrl, client: OkHttpClient = catalogClient): String = suspendCancellableCoroutine { continuation ->
     val dispatch = continuation.context[SearchDispatchState]
-    dispatch?.started = false
+    dispatch?.enqueuePage()
     val request = Request.Builder().url(url).header("Accept", "application/json")
         .tag(SearchDispatchState::class.java, dispatch).build()
     val call = client.newCall(request)
-    continuation.invokeOnCancellation {
-        if (dispatch != null) dispatch.expiredInQueue = !dispatch.started
-        call.cancel()
-    }
+    continuation.invokeOnCancellation { call.cancel() }
     call.enqueue(object : Callback {
         override fun onFailure(call: Call, e: IOException) {
             continuation.resumeWithException(e)
@@ -151,26 +161,44 @@ internal fun readCatalogResponse(response: Response): String {
     return body.string().removePrefix("\uFEFF")
 }
 
-private fun resultList(root: JSONObject): JSONArray {
-    if (root.has("code") && root.optString("code") == "0") throw CatalogResponseError("点播源返回业务错误，请重试或换源")
-    if (!root.has("list")) throw JSONException("点播源缺少 list 字段")
-    if (root.isNull("list")) return JSONArray()
-    return root.getJSONArray("list")
+private fun catalogObject(json: String): JsonObject {
+    val root = try {
+        readStrictJson(json)
+    } catch (_: IllegalArgumentException) {
+        throw JSONException("点播源返回的数据格式无效")
+    }
+    if (!root.isJsonObject) throw JSONException("点播源返回的数据格式无效")
+    return root.asJsonObject
 }
 
-private fun JSONObject.field(name: String): String =
-    if (isNull(name)) "" else optString(name).trim()
+private fun resultList(root: JsonObject): JsonArray {
+    if (root.field("code") == "0") throw CatalogResponseError("点播源返回业务错误，请重试或换源")
+    val rows = root.get("list") ?: throw JSONException("点播源缺少 list 字段")
+    if (rows.isJsonNull) return JsonArray()
+    if (!rows.isJsonArray) throw JSONException("点播源 list 字段格式无效")
+    return rows.asJsonArray
+}
+
+private fun JsonObject.field(name: String): String {
+    val value = get(name) ?: return ""
+    return when {
+        value.isJsonNull -> ""
+        value.isJsonPrimitive -> value.asString.trim()
+        else -> value.toString()
+    }
+}
 
 internal fun parseFilms(json: String): List<Film> {
     return parseCatalogPage(json).films
 }
 
 internal fun parseCatalogPage(json: String): CatalogPage {
-    val root = JSONObject(json)
+    val root = catalogObject(json)
     val rows = resultList(root)
     val films = linkedMapOf<String, Film>()
-    for (index in 0 until rows.length()) {
-        val row = rows.optJSONObject(index) ?: continue
+    for (item in rows) {
+        if (!item.isJsonObject) continue
+        val row = item.asJsonObject
         val id = row.field("vod_id")
         val title = row.field("vod_name")
         if (id.isNotEmpty() && title.isNotEmpty() && id !in films) {
@@ -184,9 +212,9 @@ internal fun parseCatalogPage(json: String): CatalogPage {
 internal fun parseLines(json: String, id: String): List<PlayLine> = parseCatalogDetail(json, id).lines
 
 internal fun parseCatalogDetail(json: String, id: String): CatalogDetail {
-    val rows = resultList(JSONObject(json))
-    val film = (0 until rows.length()).asSequence().mapNotNull { rows.optJSONObject(it) }
-        .firstOrNull { it.field("vod_id") == id || (rows.length() == 1 && it.field("vod_id").isEmpty()) }
+    val rows = resultList(catalogObject(json))
+    val film = rows.asSequence().filter { it.isJsonObject }.map { it.asJsonObject }
+        .firstOrNull { it.field("vod_id") == id || (rows.size() == 1 && it.field("vod_id").isEmpty()) }
         ?: return CatalogDetail(null, emptyList())
     val names = film.field("vod_play_from").split("$$$")
     val lines = film.field("vod_play_url").split("$$$").mapIndexedNotNull { index, group ->

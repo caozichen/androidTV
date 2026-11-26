@@ -2,6 +2,8 @@ package dev.libretv.android
 
 import java.text.Normalizer
 import java.util.Locale
+import kotlin.time.Duration.Companion.milliseconds
+import kotlin.time.TimeSource
 import kotlinx.coroutines.CancellationException
 import kotlinx.coroutines.CompletableDeferred
 import kotlinx.coroutines.CoroutineStart
@@ -69,6 +71,7 @@ internal suspend fun searchCatalogPages(
     require(query.isNotEmpty() && query.length <= 100) { "搜索词应为 1 至 100 个字符" }
     channelFlow {
         val submitted = CompletableDeferred<Unit>()
+        val deadline = TimeSource.Monotonic.markNow() + deadlineMs.milliseconds
         for (source in sources.distinctBy { it.id }) launch(start = CoroutineStart.UNDISPATCHED) {
             val films = linkedMapOf<String, Film>()
             var ranked = emptyList<Film>()
@@ -77,11 +80,13 @@ internal suspend fun searchCatalogPages(
             var page = 1
             var error: String? = null
             var truncated = false
-            val dispatch = SearchDispatchState()
-            val completed = withTimeoutOrNull(deadlineMs) {
+            val dispatch = SearchDispatchState(deadline)
+            val completed = withTimeoutOrNull(-deadline.elapsedNow()) {
                 while (page <= total) {
                     val result = try {
                         withContext(dispatch) { fetch(source, query, page) }
+                    } catch (_: CatalogQueueTimeout) {
+                        return@withTimeoutOrNull false
                     } catch (e: CancellationException) {
                         throw e
                     } catch (e: Exception) {
@@ -106,7 +111,7 @@ internal suspend fun searchCatalogPages(
                 }
                 true
             }
-            if (completed == null) error = if (dispatch.expiredInQueue) {
+            if (completed != true) error = if (dispatch.waitingForSlot) {
                 "等待请求名额超时，请重试"
             } else {
                 "点播源搜索超时，请稍后重试或换源"

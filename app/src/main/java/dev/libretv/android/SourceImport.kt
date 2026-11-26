@@ -104,7 +104,7 @@ private fun parseRow(item: JsonObject): SourceCandidate {
     return source.copy(detail = detail, isAdult = adultFlag?.asBoolean ?: false)
 }
 
-private fun readSourceJson(text: String): JsonElement {
+internal fun readStrictJson(text: String): JsonElement {
     try {
         JsonReader(StringReader(text.removePrefix("\uFEFF"))).use { reader ->
             reader.strictness = Strictness.STRICT
@@ -127,7 +127,7 @@ private fun JsonObject.arrayField(key: String): JsonArray {
 
 fun parseSourceList(text: String, existing: Set<String>): ImportPreview {
     require(text.length <= FILE_LIMIT_BYTES && text.toByteArray(Charsets.UTF_8).size <= FILE_LIMIT_BYTES) { "文件超过 1 MiB" }
-    val root = readSourceJson(text)
+    val root = readStrictJson(text)
     val rows: JsonArray
     val liveRows: JsonArray
     when {

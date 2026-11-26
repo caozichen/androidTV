@@ -9,3 +9,5 @@ local.properties
 signing.properties
 *.iml
 .DS_Store
+__pycache__/
+source-switches*.xml

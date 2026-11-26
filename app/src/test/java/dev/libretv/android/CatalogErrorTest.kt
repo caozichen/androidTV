@@ -55,4 +55,17 @@ class CatalogErrorTest {
         assertEquals("点播源响应超过 4 MiB，请换源", catalogErrorText(httpFailure(200, ByteArray(4 * 1024 * 1024 + 1))))
         assertEquals("请求失败，请重试或换源", catalogErrorText(IllegalStateException(secret)))
     }
+
+    @Test fun searchAndDetailRequireExactlyOneCompleteJsonObject() {
+        val document = """{"list":[{"vod_id":"018","vod_name":"Fixture"}]}"""
+        for (suffix in listOf("MAINTENANCE", "{}", " null", " /*comment*/", "\u0000")) {
+            val search = assertThrows(JSONException::class.java) { parseCatalogPage(document + suffix) }
+            val detail = assertThrows(JSONException::class.java) { parseCatalogDetail(document + suffix, "018") }
+            assertEquals("点播源返回的数据格式无效，请检查片源或换源", catalogErrorText(search))
+            assertEquals(catalogErrorText(search), catalogErrorText(detail))
+        }
+        val padded = "\uFEFF" + document + " \t\r\n"
+        assertEquals("018", parseCatalogPage(padded).films.single().id)
+        assertEquals("018", parseCatalogDetail(padded, "018").film?.id)
+    }
 }

@@ -3,11 +3,16 @@ package dev.libretv.android
 import java.util.concurrent.ConcurrentHashMap
 import java.util.concurrent.CountDownLatch
 import java.util.concurrent.TimeUnit
+import kotlin.time.Duration.Companion.seconds
+import kotlin.time.TestTimeSource
 import kotlinx.coroutines.CompletableDeferred
+import kotlinx.coroutines.CoroutineStart
 import kotlinx.coroutines.NonCancellable
+import kotlinx.coroutines.async
 import kotlinx.coroutines.launch
 import kotlinx.coroutines.runBlocking
 import kotlinx.coroutines.withContext
+import kotlinx.coroutines.withTimeout
 import okhttp3.Protocol
 import okhttp3.Response
 import okhttp3.ResponseBody.Companion.toResponseBody
@@ -63,6 +68,44 @@ class Release031CatalogTest {
         val recovered = mutableListOf<SourceSearchUpdate>()
         searchCatalogPages(fixtures, "雪原", 2_000, ::fetch, recovered::add)
         assertEquals(5, recovered.count { it.done && it.error == null && it.pages == 1 })
+    }
+
+    @OptIn(kotlin.time.ExperimentalTime::class)
+    @Test fun promotingAnExpiredPageBeforeCancellationDoesNotSendIt() = runBlocking {
+        val first = catalogUrl(source(1), emptyMap())
+        val second = catalogUrl(source(2), emptyMap())
+        val entered = CompletableDeferred<Unit>()
+        val release = CountDownLatch(1)
+        val requests = ConcurrentHashMap.newKeySet<String>()
+        val client = catalogClient.newBuilder()
+            .dispatcher(okhttp3.Dispatcher().apply { maxRequests = 1 })
+            .addInterceptor { chain ->
+                requests += chain.request().url.host
+                if (chain.request().url == first) {
+                    entered.complete(Unit)
+                    check(release.await(5, TimeUnit.SECONDS))
+                }
+                Response.Builder().request(chain.request()).protocol(Protocol.HTTP_1_1)
+                    .code(200).message("OK").body("ok".toResponseBody()).build()
+            }.build()
+        val clock = TestTimeSource()
+        val state = SearchDispatchState(clock.markNow() + 10.seconds)
+        val firstCall = async { fetchCatalog(first, client) }
+        try {
+            withTimeout(5_000) { entered.await() }
+            val queued = async(state, start = CoroutineStart.UNDISPATCHED) {
+                runCatching { fetchCatalog(second, client) }.exceptionOrNull()
+            }
+            assertEquals(1, client.dispatcher.queuedCallsCount())
+            clock += 10.seconds
+            release.countDown()
+            assertEquals("ok", firstCall.await())
+            assertTrue(queued.await() is CatalogQueueTimeout)
+            assertTrue(state.waitingForSlot)
+            assertEquals(setOf(first.host), requests.toSet())
+        } finally {
+            release.countDown()
+        }
     }
 
     @Test fun gSameFilmIdAndTitleStayIndependentAcrossFastAndSlowSources() = runBlocking {
